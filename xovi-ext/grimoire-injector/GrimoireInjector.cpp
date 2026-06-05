@@ -26,8 +26,24 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <chrono>
+#include <time.h>
+#include <cstdarg>
+
+static void grimoire_log(const char *fmt, ...) {
+    FILE *fp = fopen("/tmp/grimoire_ext.log", "a");
+    if (fp) {
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(fp, fmt, ap);
+        va_end(ap);
+        fprintf(fp, "\n");
+        fclose(fp);
+    }
+}
 
 static GrimoireInjector *g_instance = nullptr;
+static PenIdleWatcher *g_idleWatcher = nullptr;
 
 /* Provided by entry.c hooks */
 extern "C" {
@@ -38,8 +54,27 @@ extern "C" {
 }
 
 static void *watchThreadFunc(void *) {
-    fprintf(stderr, "[grimoire] Watch thread started\n");
+    grimoire_log("Watch thread started");
     sleep(5);  // Wait for xochitl to fully initialize
+
+    /* Start the pen idle watcher now that QGuiApplication should exist.
+     * Must invoke on main thread since installEventFilter is not thread-safe.
+     * Retry a few times in case startup is slow. */
+    bool idleWatcherStarted = false;
+    for (int attempt = 0; attempt < 10 && !idleWatcherStarted; attempt++) {
+        if (g_idleWatcher && qobject_cast<QGuiApplication*>(QCoreApplication::instance())) {
+            QMetaObject::invokeMethod(g_idleWatcher, "activate", Qt::QueuedConnection);
+            idleWatcherStarted = true;
+            grimoire_log("PenIdleWatcher activate queued (attempt %d)", attempt + 1);
+        } else {
+            grimoire_log("Waiting for QGuiApplication (attempt %d, g_idleWatcher=%p, app=%p)...",
+                         attempt + 1, (void*)g_idleWatcher, (void*)QGuiApplication::instance());
+            sleep(2);
+        }
+    }
+    if (!idleWatcherStarted) {
+        grimoire_log("WARNING: PenIdleWatcher failed to start!");
+    }
 
     const char *path = "/tmp/grimoire_strokes.json";
     long long lastMod = 0;
@@ -49,6 +84,26 @@ static void *watchThreadFunc(void *) {
         if (grimoire_checkReload()) {
             fprintf(stderr, "[grimoire] Hot-reload signal received! Re-scanning...\n");
             lastMod = 0;  // Force re-read of stroke file
+        }
+
+        /* Check for screenshot trigger */
+        if (access("/tmp/grimoire_screenshot", F_OK) == 0) {
+            unlink("/tmp/grimoire_screenshot");
+            int sw, sh, sbpl, sfmt;
+            void *fb = grimoire_getFramebuffer(&sw, &sh, &sbpl, &sfmt);
+            if (fb && sw > 0 && sh > 0) {
+                const char *outpath = "/tmp/grimoire_fb.raw";
+                FILE *fp = fopen(outpath, "wb");
+                if (fp) {
+                    size_t size = (size_t)sbpl * sh;
+                    fwrite(fb, 1, size, fp);
+                    fclose(fp);
+                    fprintf(stderr, "[grimoire] Screenshot saved: %dx%d bpl=%d (%zu bytes)\n",
+                            sw, sh, sbpl, size);
+                }
+            } else {
+                fprintf(stderr, "[grimoire] Screenshot requested but no framebuffer available\n");
+            }
         }
 
         struct stat st;
@@ -70,6 +125,13 @@ GrimoireInjector::GrimoireInjector(QObject *parent)
     : QObject(parent)
 {
     g_instance = this;
+
+    /* Start pen idle watcher — detects when user stops writing.
+     * QGuiApplication may not exist yet during _xovi_construct, so
+     * we defer event filter installation to the watch thread which
+     * retries until the app is ready. */
+    g_idleWatcher = new PenIdleWatcher(this);
+
     pthread_t tid;
     pthread_create(&tid, nullptr, watchThreadFunc, nullptr);
     pthread_detach(tid);
@@ -305,4 +367,77 @@ bool GrimoireInjector::setupVtable() {
     m_vtableReady = true;
     fprintf(stderr, "[grimoire] Vtable ready\n");
     return true;
+}
+
+/* ─── PenIdleWatcher ─────────────────────────────────────────────── */
+
+static long long nowMs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+PenIdleWatcher::PenIdleWatcher(QObject *parent)
+    : QObject(parent), m_debounceThread(0), m_running(false), m_lastLiftMs(0)
+{
+}
+
+void PenIdleWatcher::activate() {
+    if (m_running.exchange(true)) return;
+
+    auto *app = qobject_cast<QGuiApplication*>(QCoreApplication::instance());
+    if (!app) {
+        grimoire_log("PenIdleWatcher::activate: no QGuiApplication!");
+        m_running = false;
+        return;
+    }
+
+    app->installEventFilter(this);
+    grimoire_log("PenIdleWatcher: event filter installed");
+
+    pthread_create(&m_debounceThread, nullptr, debounceThreadFunc, this);
+    pthread_detach(m_debounceThread);
+    grimoire_log("PenIdleWatcher: debounce thread started (debounce=%dms)", DEBOUNCE_MS);
+}
+
+bool PenIdleWatcher::eventFilter(QObject * /*obj*/, QEvent *event) {
+    // reMarkable delivers pen input as touch + mouse events
+    if (event->type() == QEvent::MouseButtonPress ||
+        event->type() == QEvent::TouchBegin ||
+        event->type() == QEvent::TouchUpdate) {
+        m_penDown = true;
+    } else if (event->type() == QEvent::MouseButtonRelease ||
+               event->type() == QEvent::TouchEnd) {
+        m_penDown = false;
+        m_lastLiftMs = nowMs();
+    }
+    return false;
+}
+
+void *PenIdleWatcher::debounceThreadFunc(void *arg) {
+    auto *self = static_cast<PenIdleWatcher*>(arg);
+    fprintf(stderr, "[grimoire] PenIdleWatcher debounce thread running\n");
+
+    while (self->m_running) {
+        long long lift = self->m_lastLiftMs.load();
+        if (lift > 0 && !self->m_penDown.load()) {
+            long long elapsed = nowMs() - lift;
+            if (elapsed >= DEBOUNCE_MS) {
+                self->writeIdleSignal();
+                self->m_lastLiftMs = 0;  // reset so we don't re-fire
+            }
+        }
+        usleep(250000);  // check every 250ms
+    }
+    return nullptr;
+}
+
+void PenIdleWatcher::writeIdleSignal() {
+    FILE *fp = fopen(IDLE_PATH, "w");
+    if (fp) {
+        long long ts = nowMs();
+        fprintf(fp, "%lld\n", ts);
+        fclose(fp);
+        fprintf(stderr, "[grimoire] Idle signal written (pen up for %dms)\n", DEBOUNCE_MS);
+    }
 }

@@ -91,6 +91,28 @@ def _parse_d(d: str) -> list[list[tuple[float, float]]]:
     return polylines
 
 
+def _densify(
+    pts: list[tuple[float, float]], min_seg_len: float = 120.0
+) -> list[tuple[float, float]]:
+    """Subdivide a polyline so no segment is longer than min_seg_len.
+
+    Short subpaths (single line segments) render unreliably on device —
+    the renderer needs several samples to draw a visible stroke. This walks
+    each segment in glyph-space (pre-scale) and inserts evenly spaced
+    midpoints, guaranteeing at least one interior point per segment.
+    """
+    if len(pts) < 2:
+        return pts
+    out = [pts[0]]
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        dist = math.hypot(x1 - x0, y1 - y0)
+        steps = max(2, int(math.ceil(dist / min_seg_len)))
+        for s in range(1, steps + 1):
+            t = s / steps
+            out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    return out
+
+
 _FONT_CACHE: Optional[tuple[dict, dict[str, float]]] = None
 DEFAULT_SCALE = 0.07
 DEFAULT_X = -550.0
@@ -144,8 +166,14 @@ def text_to_strokes(
             for polyline in glyph:
                 if len(polyline) < 2:
                     continue
+                # Densify: subdivide each segment so even short subpaths
+                # (e.g. the arms of '*', the bowl of 'p') carry enough
+                # points for the device renderer, which collapses or drops
+                # 2-point strokes. Insert midpoints until every stroke has
+                # at least a few samples per segment.
+                dense = _densify(polyline, min_seg_len=120.0)
                 points = []
-                for j, (gx, gy) in enumerate(polyline):
+                for j, (gx, gy) in enumerate(dense):
                     sx = gx * scale
                     sy = -gy * scale
                     sx += sy * slant
@@ -171,6 +199,32 @@ def text_to_strokes(
         cursor_x += space_adv + rng.uniform(-2, 2)
 
     return result
+
+
+def _find_content_bottom(data: bytes) -> float:
+    """Scan existing strokes and return the max Y coordinate + margin.
+
+    Used to position reply text below the user's handwriting instead of
+    overwriting it. Returns DEFAULT_Y if no strokes are found.
+    """
+    max_y = 0.0
+    found = False
+    try:
+        with BytesIO(data) as f:
+            for block in read_blocks(f):
+                if isinstance(block, SceneLineItemBlock):
+                    line = block.item.value
+                    if hasattr(line, 'points'):
+                        for pt in line.points:
+                            if pt.y > max_y:
+                                max_y = pt.y
+                            found = True
+    except Exception:
+        pass
+    if not found:
+        return DEFAULT_Y
+    # Place reply below existing content with generous spacing
+    return max_y + 120.0
 
 
 def _find_last_root_child(data: bytes) -> CrdtId:
@@ -200,8 +254,9 @@ def splice_reply_new_layer(
     with open(input_path, "rb") as f:
         original_data = f.read()
 
-    # Build reply as strokes
-    strokes = text_to_strokes(reply_text, DEFAULT_X, DEFAULT_Y)
+    # Build reply as strokes, positioned below existing content
+    reply_y = _find_content_bottom(original_data)
+    strokes = text_to_strokes(reply_text, DEFAULT_X, reply_y)
 
     # CRDT IDs — author 2 for programmatic content, starting at seq 500
     # to avoid collision with existing data (real Layer 2 uses ~422-427)
@@ -300,16 +355,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("input", nargs="?", default=None)
     parser.add_argument("output", nargs="?", default=None)
-    parser.add_argument("text", nargs="?", default="Grimoire says hello")
+    parser.add_argument("text", nargs="?", default=None)
     parser.add_argument("--json", dest="json_output", default=None,
                         help="Export strokes as JSON for xovi injector")
+    parser.add_argument("--y", type=float, default=None,
+                        help="Y coordinate to start rendering at (overrides default)")
     args = parser.parse_args()
 
     if args.json_output:
-        strokes = text_to_strokes(args.text, DEFAULT_X, DEFAULT_Y)
+        # --json <output.json> [text]
+        text = args.input or "Grimoire says hello"
+        y = args.y if args.y is not None else DEFAULT_Y
+        strokes = text_to_strokes(text, DEFAULT_X, y)
         strokes_to_json(strokes, args.json_output)
     elif args.input:
+        text = args.text or "Grimoire says hello"
         output = args.output or args.input
-        splice_reply_new_layer(args.input, output, args.text)
+        splice_reply_new_layer(args.input, output, text)
     else:
         parser.error("Provide input.rm or --json output.json")

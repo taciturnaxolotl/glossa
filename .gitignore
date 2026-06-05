@@ -27,3 +27,5 @@ analysis/hashtab
 
 # Frida scripts (temporary)
 frida-explore.js
+
+.env

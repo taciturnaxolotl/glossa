@@ -57,6 +57,9 @@ void override$_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_(
         fprintf(stderr, "[grimoire] Framebuffer captured: %p %dx%d bpl=%d fmt=%d\n",
                 data, w, h, bpl, fmt);
     }
+    
+    /* Screenshot trigger is now handled by the watch thread in GrimoireInjector */
+    
     $_ZN6QImageC1EPhiiiNS_6FormatEPFvPvES2_(self, data, w, h, bpl, fmt, cleanup, info);
 }
 
@@ -91,6 +94,15 @@ void _xovi_construct() {
     if (strstr(program_invocation_short_name, "worker") != NULL) {
         return;
     }
+
+    /* Write proof-of-life to a file since stderr may be swallowed */
+    FILE *log = fopen("/tmp/grimoire_ext.log", "a");
+    if (log) {
+        fprintf(log, "[%d] _xovi_construct called for %s\n",
+                getpid(), program_invocation_short_name);
+        fclose(log);
+    }
+
     printf("[grimoire] Main process (%s), registering hooks + singleton\n",
            program_invocation_short_name);
 
