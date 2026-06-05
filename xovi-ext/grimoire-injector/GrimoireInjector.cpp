@@ -406,10 +406,12 @@ bool PenIdleWatcher::eventFilter(QObject * /*obj*/, QEvent *event) {
         event->type() == QEvent::TouchBegin ||
         event->type() == QEvent::TouchUpdate) {
         m_penDown = true;
+        m_lastActivityMs = nowMs();  // tap-refresh: slide the deadline
     } else if (event->type() == QEvent::MouseButtonRelease ||
                event->type() == QEvent::TouchEnd) {
         m_penDown = false;
         m_lastLiftMs = nowMs();
+        m_lastActivityMs = nowMs();  // lift also counts as activity
     }
     return false;
 }
@@ -419,12 +421,15 @@ void *PenIdleWatcher::debounceThreadFunc(void *arg) {
     fprintf(stderr, "[grimoire] PenIdleWatcher debounce thread running\n");
 
     while (self->m_running) {
-        long long lift = self->m_lastLiftMs.load();
-        if (lift > 0 && !self->m_penDown.load()) {
-            long long elapsed = nowMs() - lift;
+        long long activity = self->m_lastActivityMs.load();
+        // Only fire when the pen is currently up AND the page has been
+        // completely quiet (no down or up events) for the full window.
+        // Any new stroke updates m_lastActivityMs and resets the count.
+        if (activity > 0 && !self->m_penDown.load()) {
+            long long elapsed = nowMs() - activity;
             if (elapsed >= DEBOUNCE_MS) {
                 self->writeIdleSignal();
-                self->m_lastLiftMs = 0;  // reset so we don't re-fire
+                self->m_lastActivityMs = 0;  // reset so we don't re-fire
             }
         }
         usleep(250000);  // check every 250ms

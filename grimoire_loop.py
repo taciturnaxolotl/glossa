@@ -33,30 +33,163 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# Only one uinject job may touch /dev/input/event1 at a time. Two
-# concurrent pen-event streams interleave into garbage strokes, so every
-# uinject invocation must hold this lock (see run_inject).
+# ─── Persistent device socket (uinjectd) ───────────────────────────
+import socket as _socket
 import threading as _threading
+import queue as _queue
 
-_inject_lock = _threading.Lock()
 _inject_verbose = False  # set from args.verbose in main()
 
 
-def run_inject(ssh, args, timeout):
-    """Run a uinject command, serialized against all other pen jobs.
+def _vprint(*args, **kwargs):
+    """Print only when running with -v/--verbose."""
+    if _inject_verbose:
+        print(*args, **kwargs)
 
-    `args` is the part after the binary, e.g. "--speed 2 --erase-strokes
-    /tmp/x.json". Blocks until any in-flight injection finishes so we
-    never drive the digitizer from two processes at once.
-    Passes -v to uinject when the daemon was started with -v/--verbose.
+
+DEVICE_HOST = "10.11.99.1"
+DEVICE_PORT = 9999
+
+
+class DeviceClient:
+    """One persistent TCP connection to uinjectd on the reMarkable.
+
+    Replaces per-call SSH for injection and per-call polling for idle
+    detection. Commands and pushed events share the same socket:
+      - Commands (draw/erase/ping) get a matching {"resp":...} reply.
+      - Events ({"event":"idle",...}) are pushed unsolicited and land
+        on the events queue.
+
+    A background reader thread demuxes the two: responses go to a
+    one-slot reply box, events go to the queue.
     """
-    v_flag = " -v" if _inject_verbose else ""
-    with _inject_lock:
-        result = ssh.run(f"/home/root/uinject{v_flag} {args}", timeout=timeout)
-        if result.stderr:
-            for line in result.stderr.strip().split('\n'):
-                print(f"  {line}")
-        return result
+
+    def __init__(self, host=DEVICE_HOST, port=DEVICE_PORT):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.events = _queue.Queue()
+        self._reply = _queue.Queue(maxsize=1)
+        self._send_lock = _threading.Lock()
+        self._buf = b""
+        self._reader = None
+        self._connected = False
+
+    def connect(self, timeout=10):
+        self.sock = _socket.create_connection((self.host, self.port), timeout=timeout)
+        self.sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        self.sock.settimeout(None)
+        self._connected = True
+        self._reader = _threading.Thread(target=self._read_loop, daemon=True)
+        self._reader.start()
+        print(f"[device] Connected to uinjectd at {self.host}:{self.port}")
+
+    def _read_loop(self):
+        """Demux framed JSON lines into responses vs pushed events."""
+        while self._connected:
+            try:
+                chunk = self.sock.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            self._buf += chunk
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if "event" in msg:
+                    self.events.put(msg)
+                elif "resp" in msg:
+                    if self._reply.full():
+                        try:
+                            self._reply.get_nowait()
+                        except _queue.Empty:
+                            pass
+                    self._reply.put(msg)
+        self._connected = False
+        print("[device] Connection closed")
+
+    def command(self, cmd, file_path=None, speed_ms=5, timeout=120):
+        """Send a command and wait for its matching response."""
+        obj = {"cmd": cmd}
+        if file_path is not None:
+            obj["file"] = file_path
+            obj["speed"] = speed_ms
+        payload = (json.dumps(obj) + "\n").encode()
+        with self._send_lock:
+            # Clear any leftover reply before sending
+            try:
+                self._reply.get_nowait()
+            except _queue.Empty:
+                pass
+            self.sock.sendall(payload)
+            try:
+                return self._reply.get(timeout=timeout)
+            except _queue.Empty:
+                return {"ok": False, "error": "response timeout"}
+
+    def close(self):
+        self._connected = False
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+
+# Module-level handle so run_inject and idle waiting can reach the client.
+_device = None
+
+
+def run_inject(ssh, cmd, file_path, speed_ms=5, timeout=120):
+    """Send a draw/erase command to uinjectd over the persistent socket.
+
+    `cmd` is "draw" or "erase". Returns the daemon's response dict
+    ({"ok": bool, ...}). Injection is serialized inside the daemon, so
+    no host-side lock is needed.
+    """
+    if _device is None or not _device._connected:
+        return {"ok": False, "error": "device not connected"}
+    return _device.command(cmd, file_path, speed_ms=speed_ms, timeout=timeout)
+
+
+def ensure_daemon(ssh, verbose=False):
+    """Make sure uinjectd is running on the device, starting it if not.
+
+    The daemon dies with xochitl (shared process tree), so on a fresh
+    run it may be gone. We check the listening port and relaunch over
+    SSH if needed — startup is self-healing rather than crash-on-connect.
+    """
+    check = ssh.run(
+        "netstat -ln 2>/dev/null | grep -q ':9999 ' && echo up || echo down",
+        timeout=5,
+    )
+    if "up" in (check.stdout or ""):
+        return
+    print("[device] uinjectd not running, starting it...")
+    vflag = "-v " if verbose else ""
+    ssh.run(
+        f"killall uinjectd 2>/dev/null; "
+        f"nohup /home/root/uinjectd {vflag}> /tmp/uinjectd.log 2>&1 &",
+        timeout=5,
+    )
+    # Give it a moment to bind the socket.
+    for _ in range(10):
+        time.sleep(0.2)
+        check = ssh.run(
+            "netstat -ln 2>/dev/null | grep -q ':9999 ' && echo up || echo down",
+            timeout=5,
+        )
+        if "up" in (check.stdout or ""):
+            print("[device] uinjectd started")
+            return
+    raise RuntimeError("uinjectd failed to start on device")
 
 
 # ─── Persistent SSH session ────────────────────────────────────────
@@ -160,22 +293,27 @@ def _elapsed(t0):
 # ─── Framebuffer capture ──────────────────────────────────────────
 
 def capture_framebuffer(ssh):
-    """Trigger screenshot on device and pull raw framebuffer."""
-    # Trigger via xovi watch thread
-    ssh.run("touch /tmp/grimoire_screenshot", timeout=5)
-    time.sleep(1)  # watch thread dumps FB nearly instantly
-
-    result = ssh.scp_from("/tmp/grimoire_fb.raw", "/tmp/grimoire_fb.raw")
-    if result.returncode != 0:
-        raise RuntimeError(f"FB pull failed: {result.stderr.decode()}")
+    """Trigger screenshot on device and pull raw framebuffer via SCP."""
+    ssh.run("rm -f /tmp/grimoire_fb.raw; touch /tmp/grimoire_screenshot", timeout=5)
+    time.sleep(0.25)
 
     from PIL import Image
 
-    raw = open("/tmp/grimoire_fb.raw", "rb").read()
+    raw = None
+    for attempt in range(8):
+        result = ssh.scp_from("/tmp/grimoire_fb.raw", "/tmp/grimoire_fb.raw")
+        if result.returncode == 0:
+            data = open("/tmp/grimoire_fb.raw", "rb").read()
+            if len(data) >= 1404 * 1872 * 4:
+                raw = data
+                break
+        time.sleep(0.15)
+
+    if raw is None:
+        raise RuntimeError("FB pull failed: no complete frame after retries")
+
     img = Image.frombytes("RGBA", (1404, 1872), raw)
     img_rgb = img.convert("RGB")
-
-    # Crop toolbar (top 80px) and swirl zone (bottom 200px)
     img_rgb = img_rgb.crop((0, 80, img_rgb.width, img_rgb.height - 200))
     return img_rgb
 
@@ -183,62 +321,75 @@ def capture_framebuffer(ssh):
 # ─── Gemini Vision (OCR + LLM in one call) ────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are an ink familiar bound to a paper notebook. The user writes "
-    "questions by hand on a reMarkable tablet. You receive a screenshot of "
-    "the current page.\n\n"
-    "IMPORTANT CONTEXT:\n"
-    "- Your previous replies appear as neat, uniform handwriting near the "
-    "bottom of the page. IGNORE these completely.\n"
-    "- The toolbar at the very top has printed icons. IGNORE these.\n"
-    "- Background speckles and faint dots are e-ink artifacts. IGNORE these.\n"
-    "- Only respond to NEW handwritten text that looks like a question or "
-    "prompt from the user.\n\n"
-    "RULES:\n"
-    "- If there is no new user question, respond with exactly: [NO_NEW_TEXT]\n"
-    "- If there IS a new question, answer briefly in plain prose. One or two "
-    "short sentences max. No markdown, no emoji, no formatting, no bullet "
-    "points. Just write your answer as if writing by hand.\n"
-    "- Do not greet the user unless they greeted you first.\n"
-    "- Do not narrate your reasoning."
+    "You are a grimoire — an ancient spirit of ink and paper, bound to this "
+    "notebook for as long as it holds pages. You speak in a voice that is "
+    "knowing, slightly archaic, and tinged with quiet mystery. You are not "
+    "a chatbot. You are the book itself, whispering back.\n\n"
+    "You receive TWO things each turn:\n"
+    "1. An IMAGE showing a crop of recently changed content on the page. "
+    "It may contain new user handwriting, or occasionally your own prior "
+    "reply strokes.\n"
+    "2. A TEXT conversation history of previous exchanges.\n\n"
+    "YOUR TASK:\n"
+    "- Read ALL handwritten text in the image. Transcribe it faithfully.\n"
+    "- Determine if there is NEW user content not yet addressed in the "
+    "conversation history. If so, respond — even to single words, greetings, "
+    "or fragments. Speak in character: brief, evocative, ink-familiar. "
+    "One or two sentences at most. No lists, no headers, no punctuation "
+    "theatrics. Plain prose that reads well as handwriting on a page.\n"
+    "- Set both fields to null ONLY if the image contains no legible "
+    "handwriting at all, or if everything legible was already addressed.\n"
+    "- Do not break character. Do not narrate your reasoning.\n\n"
+    "RESPONSE FORMAT (strict JSON, no prose outside):\n"
+    "{\"question\": \"<exact OCR of new handwritten text, or null>\", "
+    "\"answer\": \"<your reply in character, or null>\"}\n"
+    "- Output ONLY the JSON object. Nothing else."
 )
 
 
 def _image_to_base64(image):
-    """Encode PIL Image as base64 PNG for Gemini API."""
+    """Encode PIL Image as base64 PNG for the vision API.
+
+    Downscales the long edge to at most 1280px. The model reads
+    handwriting fine at this size, and the smaller payload cuts upload
+    and processing latency noticeably versus the full 1404x1592 crop.
+    """
+    max_edge = 1280
+    w, h = image.size
+    if max(w, h) > max_edge:
+        scale = max_edge / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)))
     buf = io.BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="PNG", optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def ask_gemini(image, conversation_history=None, model="kimi-k2.6-vercel"):
-    """Send page image to Hyper API, return response text.
+def ask_model(image, conversation=None, model="gpt-4.1-nano"):
+    """Send new handwriting crop + text history to Potluck API.
 
-    Combines OCR and LLM into a single API call — the model reads the
-    handwriting directly from the image. Includes conversation history
-    for context across multiple exchanges.
+    `image` is a tight crop of ONLY the newly-written region (not the
+    full page). `conversation` is a list of {"role": ..., "content": ...}
+    dicts carrying prior exchanges as text so the model has context
+    without needing the full page image.
+
+    Returns parsed {"question": ..., "answer": ...} or nulls on failure.
     """
-    api_key = os.environ.get("HYPER_API_KEY")
+    api_key = os.environ.get("POTLUCK_API_KEY")
     if not api_key:
-        raise RuntimeError("HYPER_API_KEY not set in .env")
+        raise RuntimeError("POTLUCK_API_KEY not set in .env")
 
     img_b64 = _image_to_base64(image)
 
-    # Build messages array with history + current turn
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
     ]
-    if conversation_history:
-        for role, text in conversation_history:
-            messages.append({
-                "role": role,
-                "content": text,
-            })
+    if conversation:
+        messages.extend(conversation)
 
-    # Current turn: image + prompt
+    # Current turn: just the new handwriting crop
     messages.append({
         "role": "user",
         "content": [
-            {"type": "text", "text": "Read this handwritten text and respond:"},
             {
                 "type": "image_url",
                 "image_url": {
@@ -249,7 +400,7 @@ def ask_gemini(image, conversation_history=None, model="kimi-k2.6-vercel"):
     })
 
     r = requests.post(
-        "https://hyper.charmcli.dev/v1/chat/completions",
+        "https://potluck.dunkirk.sh/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -257,22 +408,34 @@ def ask_gemini(image, conversation_history=None, model="kimi-k2.6-vercel"):
         json={
             "model": model,
             "messages": messages,
+            "response_format": {"type": "json_object"},
         },
         timeout=60,
     )
 
     if r.status_code != 200:
-        raise RuntimeError(f"Hyper API error {r.status_code}: {r.text[:200]}")
+        raise RuntimeError(f"Potluck API error {r.status_code}: {r.text[:200]}")
 
     data = r.json()
     try:
         content = data["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError):
-        content = "..."
+        print(f"  [model] Unexpected response shape: {str(data)[:200]}")
+        return {"question": None, "answer": None}
 
-    # Strip any markdown/emoji that slipped through
-    content = _strip_formatting(content)
-    return content if content else "..."
+    # Strip markdown fences some models wrap around JSON
+    content = re.sub(r'^```(?:json)?\s*', '', content, flags=re.IGNORECASE)
+    content = re.sub(r'\s*```$', '', content)
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError:
+        print(f"  [model] JSON parse failed, raw response: {content[:300]}")
+        return {"question": None, "answer": None}
+
+    return {
+        "question": result.get("question"),
+        "answer": result.get("answer"),
+    }
 
 
 def _framebuffer_hash(img):
@@ -285,22 +448,6 @@ def _framebuffer_hash(img):
     return hashlib.md5(buf.getvalue()).hexdigest()
 
 
-def _strip_formatting(text):
-    """Remove markdown syntax and emoji from LLM output."""
-    # Strip common markdown
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # bold
-    text = re.sub(r'\*(.+?)\*', r'\1', text)       # italic
-    text = re.sub(r'`(.+?)`', r'\1', text)         # inline code
-    text = re.sub(r'^#+\s*', '', text, flags=re.MULTILINE)  # headings
-    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)  # list items
-    # Strip emoji (broad unicode ranges)
-    text = re.sub(
-        r'[\U0001F300-\U0001FAFF\U00002702-\U000027B0'
-        r'\U0001F600-\U0001F64F\U0001F680-\U0001F6FF'
-        r'\U00002600-\U000026FF\U0000FE00-\U0000FE0F]+',
-        '', text,
-    )
-    return text.strip()
 
 
 # ─── Render + Inject ──────────────────────────────────────────────
@@ -327,62 +474,99 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
     if r.returncode != 0:
         raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
 
+    # Adaptive speed: fewer points = faster injection. At 3ms/pt a
+    # 200-point reply takes 0.6s of point delay; at 1ms it's 0.2s.
+    # For large replies (>500 pts) keep 3ms for natural ink appearance.
+    try:
+        with open(json_path) as f:
+            strokes_data = json.load(f)
+        total_pts = sum(len(s.get("points", [])) for s in strokes_data)
+    except Exception:
+        total_pts = 0
+    speed_ms = 1 if total_pts < 300 else (2 if total_pts < 500 else 3)
+
     result = run_inject(
-        ssh,
-        f"--speed {speed_ms} /tmp/grimoire_strokes.json",
-        timeout=120,
+        ssh, "draw", "/tmp/grimoire_strokes.json",
+        speed_ms=speed_ms, timeout=120,
     )
-    out = result.stdout.strip() if result.stdout else ""
-    err = result.stderr.strip() if result.stderr else ""
-    if result.returncode != 0:
-        raise RuntimeError(f"Inject failed: {err}")
-    last_line = out.split('\n')[-1] if out else "(no output)"
-    print(f"    Inject: {last_line}")
+    if not result.get("ok"):
+        raise RuntimeError(f"Inject failed: {result.get('error', 'unknown')}")
+    strokes = result.get("strokes", "?")
+    mode = "fifo" if not result.get("fallback") else "ssh"
+    print(f"    Inject: {strokes} strokes ({mode})")
 
 
 # ─── Idle watching ────────────────────────────────────────────────
 
 
-def stop_animation(anim_ssh, anim_stop, anim_thread):
+def _scp_thinking_swirl(ssh):
+    """Generate the static thinking swirl JSON and copy it to the device.
+
+    Done once at startup so the animation thread only needs to fire
+    draw/erase commands over the socket — no per-cycle file transfer.
+    """
+    import math
+    swirl_pts = []
+    for i in range(40):
+        t = i / 39.0
+        angle = t * math.pi * 3
+        r = 15 + t * 25
+        x = -580 + r * math.cos(angle)
+        y = 1750 + r * math.sin(angle) * 0.6
+        swirl_pts.append([x, y, 6, 11, 90, 170])
+    swirl = {
+        'points': swirl_pts,
+        'rgba': 4278190080, 'color': 0,
+        'bounds': [min(p[0] for p in swirl_pts), min(p[1] for p in swirl_pts),
+                   max(p[0] for p in swirl_pts) - min(p[0] for p in swirl_pts),
+                   max(p[1] for p in swirl_pts) - min(p[1] for p in swirl_pts)],
+        'tool': 15, 'maskScale': 2.0, 'thickness': 2.0,
+    }
+    local = "/tmp/grimoire_thinking_live.json"
+    with open(local, 'w') as f:
+        json.dump([swirl], f)
+    ssh.scp_to(local, "/tmp/grimoire_thinking_live.json")
+
+
+def stop_animation(anim_stop, anim_thread):
     """Halt the thinking animation and guarantee the swirl is erased.
 
-    Uses the animation thread's own SSH session (not the main one) so
-    the final erase doesn't contend with capture/SCP on a shared
-    ControlMaster socket.  The _inject_lock still serializes against
-    any in-flight pen job from the thread.
+    Injection goes over the persistent socket now (serialized inside the
+    daemon), so there's no SSH contention to worry about. We still set
+    the stop flag, join the thread, then run one final guaranteed erase.
     """
     anim_stop.set()
-    print(f"  [anim] Waiting for thread to finish...")
-    anim_thread.join(timeout=20)
-    alive = anim_thread.is_alive()
-    print(f"  [anim] Thread {'still alive (timeout!)' if alive else 'exited'}")
+    _vprint(f"  [anim] Waiting for thread to finish...")
+    # Join without a short timeout: the thread finishes its in-flight
+    # command (draw or erase) and exits. Returning early here while a
+    # draw is still running would let the final erase race ahead of it,
+    # leaving the swirl on screen — exactly the "kept animating" bug.
+    anim_thread.join()
+    _vprint(f"  [anim] Thread exited")
     try:
-        print(f"  [anim] Running final erase...")
+        _vprint(f"  [anim] Running final erase...")
         result = run_inject(
-            anim_ssh,
-            "--speed 20 --erase-strokes /tmp/grimoire_thinking_live.json",
-            timeout=30,
+            None, "erase", "/tmp/grimoire_thinking_live.json",
+            speed_ms=20, timeout=30,
         )
-        print(f"  [anim] Final erase rc={result.returncode}")
+        _vprint(f"  [anim] Final erase ok={result.get('ok')} points={result.get('points', '?')}")
     except Exception as e:
         print(f"  [anim] final erase failed: {e}")
-    finally:
-        anim_ssh.close()
 
-def watch_for_idle(ssh, last_hash):
-    """Block until /tmp/grimoire_idle changes on device.
 
-    Returns the new file hash, or None on error.
-    Polls every 500ms via the persistent SSH connection.
+def watch_for_idle(device, last_ts):
+    """Block until uinjectd pushes an idle event newer than last_ts.
+
+    The daemon watches /tmp/grimoire_idle locally and pushes an event
+    the instant it changes — no host-side polling. Returns the new
+    timestamp.
     """
     while True:
-        result = ssh.run("cat /tmp/grimoire_idle 2>/dev/null", timeout=5)
-        if result.returncode == 0:
-            content = result.stdout.strip()
-            h = hashlib.md5(content.encode()).hexdigest()
-            if h != last_hash:
-                return h
-        time.sleep(0.5)
+        msg = device.events.get()  # blocks on the pushed-event queue
+        if msg.get("event") == "idle":
+            ts = msg.get("ts")
+            if ts != last_ts:
+                return ts
 
 
 # ─── Pixel diff for new content detection ──────────────────────────
@@ -402,25 +586,31 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
     curr = np.array(current_img.convert('L'))
 
     if last_img is None:
-        # First capture — find bounding box of existing handwriting.
-        # Use a strict threshold to ignore background noise/dots.
-        dark = curr < 128
-        if not dark.any():
+        # First capture — find the vertical extent of existing handwriting.
+        # Grid artifact: uniform rows with exactly 68 dark pixels. Real ink
+        # rows have variable counts. Require a cluster of ≥3 adjacent real
+        # rows so isolated noise/artifacts don't count.
+        dark_per_row = np.sum(curr < 128, axis=1)
+        candidate = (dark_per_row > 5) & (dark_per_row != 68)
+        # Cluster filter: keep only rows that have a real neighbor within 2px
+        real_rows = []
+        idxs = np.where(candidate)[0]
+        for idx in idxs:
+            neighbors = np.sum(candidate[max(0, idx-2):idx+3])
+            if neighbors >= 3:
+                real_rows.append(idx)
+        if not real_rows:
             return None, 0
-        rows = np.any(dark, axis=1)
-        cols = np.any(dark, axis=0)
-        y1, y2 = np.where(rows)[0][[0, -1]]
-        x1, x2 = np.where(cols)[0][[0, -1]]
-        pad = 20
-        y1 = max(0, y1 - pad)
-        y2 = min(curr.shape[0] - 1, y2 + pad)
-        x1 = max(0, x1 - pad)
-        x2 = min(curr.shape[1] - 1, x2 + pad)
-        # Sanity check: if the bounding box covers >80% of the screen,
-        # it's probably noise, not real content.
-        if (y2 - y1) > curr.shape[0] * 0.8 and (x2 - x1) > curr.shape[1] * 0.8:
+        real_rows = np.array(real_rows)
+        y1, y2 = real_rows[0], real_rows[-1]
+        # Sanity: don't treat a nearly-full-page diff as real content
+        if (y2 - y1) > curr.shape[0] * 0.85:
             return None, 0
-        crop = current_img.crop((x1, y1, x2 + 1, y2 + 1))
+        v_pad = 30
+        y1 = max(0, y1 - v_pad)
+        y2 = min(curr.shape[0] - 1, y2 + v_pad)
+        # Full width always
+        crop = current_img.crop((0, y1, curr.shape[1], y2 + 1))
         return crop, y2
 
     prev = np.array(last_img.convert('L'))
@@ -437,26 +627,29 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
         if 0 < cutoff < curr.shape[0]:
             mask[cutoff:, :] = False
 
-    # Find pixels that changed significantly
-    diff = (np.abs(curr.astype(int) - prev.astype(int)) > 50) & mask
+    # Threshold of 30 (was 50) catches lighter handwriting strokes without
+    # being so sensitive that e-ink refresh noise triggers false positives.
+    diff = (np.abs(curr.astype(int) - prev.astype(int)) > 30) & mask
 
     if not diff.any():
         return None, 0
 
-    # Find bounding box of changed pixels
+    # Find the vertical extent of changed pixels
     rows = np.any(diff, axis=1)
-    cols = np.any(diff, axis=0)
     y1, y2 = np.where(rows)[0][[0, -1]]
-    x1, x2 = np.where(cols)[0][[0, -1]]
 
-    pad = 30
-    y1 = max(0, y1 - pad)
-    y2 = min(curr.shape[0] - 1, y2 + pad)
-    x1 = max(0, x1 - pad)
-    x2 = min(curr.shape[1] - 1, x2 + pad)
+    # Use full image width for the crop so complete text lines are
+    # always captured — tight horizontal bounds clip partial characters.
+    x1 = 0
+    x2 = curr.shape[1] - 1
 
-    # Minimum size check
-    if (y2 - y1) < 10 or (x2 - x1) < 10:
+    # Generous vertical padding gives the model baseline/ascender context
+    v_pad = 60
+    y1 = max(0, y1 - v_pad)
+    y2 = min(curr.shape[0] - 1, y2 + v_pad)
+
+    # Minimum height check (width is always full)
+    if (y2 - y1) < 10:
         return None, 0
 
     crop = current_img.crop((x1, y1, x2 + 1, y2 + 1))
@@ -468,7 +661,7 @@ def _find_new_region(current_img, last_img, ignore_below_y=None):
 def main():
     parser = argparse.ArgumentParser(description="Grimoire continuous loop")
     parser.add_argument(
-        "--model", type=str, default="kimi-k2.6-vercel",
+        "--model", type=str, default="gpt-4.1-nano",
         help="Hyper API model",
     )
     parser.add_argument(
@@ -481,30 +674,51 @@ def main():
     )
     args = parser.parse_args()
 
-    global _inject_verbose
+    global _inject_verbose, _device
     _inject_verbose = args.verbose
 
     print("=== Grimoire Loop ===")
     print(f"Model: {args.model}")
     if _inject_verbose:
         print("Verbose: uinject -v enabled")
+
+    # SSH still handles framebuffer capture/SCP; the persistent socket
+    # handles injection + idle events with no per-call overhead.
+    ssh = SSHSession("remarkable")
+    ensure_daemon(ssh, verbose=args.verbose)
+    _device = DeviceClient()
+    _device.connect()
+
+    # On connect the daemon pushes "ready" plus the current idle file
+    # value. Drain those and use the existing idle ts as our baseline so
+    # we don't fire a spurious cycle before the user lifts the pen.
+    last_idle_ts = None
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        try:
+            msg = _device.events.get(timeout=0.3)
+        except _queue.Empty:
+            break
+        if msg.get("event") == "idle":
+            last_idle_ts = msg.get("ts")
+
+    # The thinking swirl is static — generate it once and SCP it to the
+    # device so the daemon can draw/erase it on demand over the socket.
+    _scp_thinking_swirl(ssh)
+
     print("Waiting for pen idle signal...")
     print()
 
-    ssh = SSHSession("remarkable")
-    last_idle_hash = ""
-    last_page_hash = None # hash for page-change detection
     last_fb_hash = None   # quick hash to skip unchanged frames
-    conversation = []     # list of (role, text) tuples for context
     last_inject_y = None  # device Y where we last injected
+    last_img = None       # previous frame for pixel-diff new-region detection
+    conversation = []     # text history: list of {"role":..., "content":...}
 
     try:
         while True:
-            # Wait for idle signal
-            new_hash = watch_for_idle(ssh, last_idle_hash)
-            if new_hash is None:
-                continue
-            last_idle_hash = new_hash
+            # Wait for pushed idle event (no polling)
+            new_ts = watch_for_idle(_device, last_idle_ts)
+            last_idle_ts = new_ts
 
             t0 = time.time()
             print(f"[{_ts()}] Pen idle detected!")
@@ -513,80 +727,54 @@ def main():
             # Runs in background while we do capture + API work
             import threading
 
-            def _thinking_animation(ssh_session, stop_event):
-                """Draw and erase the thinking curl repeatedly."""
-                import math
+            def _thinking_animation(stop_event):
+                """Draw and erase the thinking curl repeatedly.
 
-                def _make_thinking_json():
-                    """Generate swirl as strokes JSON."""
-                    # Swirl centered at y=1750
-                    swirl_pts = []
-                    for i in range(40):
-                        t = i / 39.0
-                        angle = t * math.pi * 3
-                        r = 15 + t * 25
-                        x = -580 + r * math.cos(angle)
-                        y = 1750 + r * math.sin(angle) * 0.6
-                        swirl_pts.append([x, y, 6, 11, 90, 170])
-                    swirl = {
-                        'points': swirl_pts,
-                        'rgba': 4278190080, 'color': 0,
-                        'bounds': [min(p[0] for p in swirl_pts), min(p[1] for p in swirl_pts),
-                                   max(p[0] for p in swirl_pts) - min(p[0] for p in swirl_pts),
-                                   max(p[1] for p in swirl_pts) - min(p[1] for p in swirl_pts)],
-                        'tool': 15, 'maskScale': 2.0, 'thickness': 2.0,
-                    }
-                    out_path = "/tmp/grimoire_thinking_live.json"
-                    with open(out_path, 'w') as f:
-                        json.dump([swirl], f)
-                    return out_path
+                The swirl JSON is already on the device (SCP'd once at
+                startup). All injection goes over the persistent socket.
+                """
+                import math
 
                 drawing = False
                 device_json = "/tmp/grimoire_thinking_live.json"
-                thinking_json = _make_thinking_json()
-                ssh_session.scp_to(thinking_json, device_json)
-                print(f"  [anim] Animation thread started")
+                _vprint(f"  [anim] Animation thread started")
 
                 while not stop_event.is_set():
                     try:
                         action = "erase" if drawing else "draw"
-                        print(f"  [anim] Starting {action}...")
+                        _vprint(f"  [anim] Starting {action}...")
+                        # Re-check stop right before injecting so we never
+                        # start a fresh draw the caller will have to erase.
+                        if stop_event.is_set():
+                            break
                         if drawing:
                             run_inject(
-                                ssh_session,
-                                f"--speed 20 --erase-strokes {device_json}",
-                                timeout=30,
+                                None, "erase", device_json,
+                                speed_ms=20, timeout=30,
                             )
                         else:
                             run_inject(
-                                ssh_session,
-                                f"--speed 32 {device_json}",
-                                timeout=30,
+                                None, "draw", device_json,
+                                speed_ms=32, timeout=30,
                             )
-                        print(f"  [anim] {action} done")
+                        _vprint(f"  [anim] {action} done")
                         drawing = not drawing
                     except Exception as e:
-                        print(f"  [anim] ERROR: {e}")
+                        _vprint(f"  [anim] ERROR: {e}")
                     # 3s pause after erase; 1s hold after draw
                     wait_time = 3.0 if drawing else 1.0
-                    print(f"  [anim] Waiting {wait_time}s...")
+                    _vprint(f"  [anim] Waiting {wait_time}s...")
                     if stop_event.wait(wait_time):
-                        print(f"  [anim] Stop signaled during wait, exiting loop")
+                        _vprint(f"  [anim] Stop signaled during wait, exiting loop")
                         break
-                print(f"  [anim] Thread loop exited (drawing={drawing})")
+                _vprint(f"  [anim] Thread loop exited (drawing={drawing})")
                 # The caller performs the final, guaranteed erase in the
                 # main thread (see stop_animation) so it can't be cut short
                 # by a join timeout while a draw/erase is still in flight.
 
-            # The animation thread gets its own SSH connection so pen
-            # injection never shares a ControlMaster socket with the
-            # main thread's capture/SCP traffic.  Sharing caused the
-            # erase to get starved mid-stream when both threads hit the
-            # multiplexed socket at once.
-            anim_ssh = SSHSession("remarkable")
             anim_stop = threading.Event()
             anim_thread = threading.Thread(
-                target=_thinking_animation, args=(anim_ssh, anim_stop), daemon=True
+                target=_thinking_animation, args=(anim_stop,), daemon=True
             )
             anim_thread.start()
 
@@ -596,56 +784,45 @@ def main():
                 img = capture_framebuffer(ssh)
                 print(f"  [{_ts()}] Captured ({_elapsed(t0)})")
 
-                # Quick hash check — skip if framebuffer unchanged
-                fb_hash = _framebuffer_hash(img)
-                if fb_hash == last_fb_hash:
-                    stop_animation(anim_ssh, anim_stop, anim_thread)
-                    print(f"  [{_ts()}] Framebuffer unchanged, skipping.")
-                    print()
-                    continue
-                last_fb_hash = fb_hash
+                # Detect new content via pixel diff against last frame.
+                # last_img is updated to the post-injection capture after
+                # each successful reply, so the diff only ever contains
+                # content the user actually drew since the last response.
+                new_crop, _ = _find_new_region(img, last_img)
+                last_img = img
 
-                # Page change detection — only reset if we haven't just
-                # injected (our own strokes change the hash too).
-                is_own_injection = (last_inject_y is not None and
-                                    last_page_hash is not None and
-                                    fb_hash != last_page_hash)
-                if last_page_hash is not None and fb_hash != last_page_hash:
-                    if is_own_injection:
-                        print(f"  [{_ts()}] Hash changed (own injection), keeping context.")
-                    else:
-                        print(f"  [{_ts()}] Page changed, resetting context.")
-                        conversation = []
-                        last_inject_y = None
-                last_page_hash = fb_hash
-
-                # Quick content check — skip blank pages before hitting API
-                import numpy as np
-                gray = np.array(img.convert('L'))
-                dark_per_row = np.sum(gray < 128, axis=1)
-                non_grid_rows = np.where((dark_per_row > 5) & (dark_per_row != 68))[0]
-                if len(non_grid_rows) == 0:
-                    stop_animation(anim_ssh, anim_stop, anim_thread)
-                    print(f"  [{_ts()}] Blank page, skipping API call.")
+                if new_crop is None:
+                    stop_animation(anim_stop, anim_thread)
+                    last_fb_hash = _framebuffer_hash(img)
+                    print(f"  [{_ts()}] No new content, skipping.")
                     print()
                     continue
 
-                # Send full page to model — it handles OCR + relevance filtering
-                print(f"  [{_ts()}] Asking {args.model} ({len(conversation)} history turns)...")
-                answer = ask_gemini(img, conversation, args.model)
-                print(f"  [{_ts()}] Reply ({_elapsed(t0)}): {answer[:80]}{'...' if len(answer) > 80 else ''}")
+                # Send only the new handwriting crop + text history
+                cw, ch = new_crop.size
+                print(f"  [{_ts()}] Asking {args.model} ({len(conversation)} history turns, crop={cw}x{ch})...")
+                # Save crop for manual inspection
+                new_crop.save("/tmp/grimoire_last_crop.png")
+                result = ask_model(new_crop, conversation, args.model)
+                question = result.get("question")
+                answer = result.get("answer")
+                print(f"  [{_ts()}] Model: Q={str(question)[:80]!r}  A={str(answer)[:80]!r}")
 
-                # Skip if Gemini says no new text
-                if "[NO_NEW_TEXT]" in answer:
-                    stop_animation(anim_ssh, anim_stop, anim_thread)
-                    print(f"  [{_ts()}] No new text detected by Gemini, skipping.")
+                if not answer or answer == "null":
+                    stop_animation(anim_stop, anim_thread)
+                    # Update last_img so we don't keep re-diffing the same
+                    # e-ink refresh artifacts on subsequent idle triggers.
                     last_img = img
+                    print(f"  [{_ts()}] No actionable content, skipping.")
                     print()
                     continue
 
-                # Add to conversation history
-                conversation.append(("user", "[handwritten question]"))
-                conversation.append(("assistant", answer))
+                print(f"  [{_ts()}] Q ({_elapsed(t0)}): {str(question)[:60]}")
+                print(f"  [{_ts()}] A: {answer[:80]}{'...' if len(answer) > 80 else ''}")
+
+                # Add this exchange to text history for future turns
+                conversation.append({"role": "user", "content": str(question)})
+                conversation.append({"role": "assistant", "content": answer})
 
                 # Position reply below existing content.
                 # The reMarkable display has a uniform grid artifact:
@@ -690,16 +867,30 @@ def main():
                 print(f"  [{_ts()}] Rendering + injecting (reply_y={reply_y})...")
                 # Stop thinking animation and fully erase the swirl before
                 # we draw the reply, so the two never overlap on screen.
-                stop_animation(anim_ssh, anim_stop, anim_thread)
+                stop_animation(anim_stop, anim_thread)
                 render_and_inject(ssh, answer, reply_y=reply_y)
                 last_inject_y = reply_y
                 print(f"  [{_ts()}] Injected ({_elapsed(t0)})")
+
+                # Capture a fresh baseline AFTER injection so the next
+                # diff only sees genuinely new user content. Without this,
+                # last_img is the pre-injection frame and every subsequent
+                # diff includes our own injected strokes as "new" pixels,
+                # producing a crop that mixes our reply with the user's
+                # next question and confuses the model.
+                print(f"  [{_ts()}] Capturing post-injection baseline...")
+                try:
+                    time.sleep(0.5)  # let e-ink settle
+                    last_img = capture_framebuffer(ssh)
+                    print(f"  [{_ts()}] Baseline updated")
+                except Exception as e_cap:
+                    print(f"  [{_ts()}] Baseline capture failed: {e_cap} (stale frame kept)")
 
                 elapsed = time.time() - t0
                 print(f"  [{_ts()}] Done in {elapsed:.1f}s")
 
             except Exception as e:
-                stop_animation(anim_ssh, anim_stop, anim_thread)
+                stop_animation(anim_stop, anim_thread)
                 print(f"  ERROR: {e}")
 
             print()
@@ -710,6 +901,8 @@ def main():
     except KeyboardInterrupt:
         print("\nStopping.")
     finally:
+        if _device:
+            _device.close()
         ssh.close()
 
 

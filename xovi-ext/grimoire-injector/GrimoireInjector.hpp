@@ -49,7 +49,14 @@ private:
     pthread_t m_debounceThread;
     std::atomic<bool> m_running{false};
     std::atomic<long long> m_lastLiftMs{0};
+    // Updated on EVERY pen event (down or up). The idle countdown is
+    // measured from this, so any new stroke slides the deadline forward
+    // — a tap-refresh that survives normal mid-drawing pauses.
+    std::atomic<long long> m_lastActivityMs{0};
 
+    // 2.5s of total pen silence before we consider the page "settled".
+    // Combined with the tap-refresh (any stroke resets the window),
+    // normal mid-drawing pauses won't trigger it.
     static constexpr int DEBOUNCE_MS = 2500;
     static constexpr const char *IDLE_PATH = "/tmp/grimoire_idle";
 
