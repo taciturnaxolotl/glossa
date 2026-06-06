@@ -31,6 +31,11 @@
 #include <signal.h>
 #include <time.h>
 #include <png.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
 
 #define DEV_PATH     "/dev/input/event1"
 #define TOUCH_PATH   "/dev/input/event2"
@@ -42,6 +47,10 @@
 #define FB_RAW_PATH  "/tmp/grimoire_fb.raw"
 #define SCREENSHOT_TRIGGER "/tmp/grimoire_screenshot"
 #define CAPTURE_OUT_PATH "/tmp/grimoire_capture.png"
+#define API_KEY_PATH   "/home/root/.grimoire_key"
+#define API_HOST       "potluck.dunkirk.sh"
+#define API_PATH       "/v1/chat/completions"
+#define API_MODEL      "gpt-4.1-nano"
 #define MAX_CMD      8192
 
 /* Framebuffer dimensions */
@@ -360,6 +369,374 @@ static unsigned char *trigger_and_read_fb(void) {
     return NULL;
 }
 
+/* ─── base64 encoding ────────────────────────────────────────────── */
+
+static const char b64_table[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *base64_encode(const unsigned char *data, long len, long *out_len) {
+    long olen = 4 * ((len + 2) / 3);
+    char *out = malloc(olen + 1);
+    if (!out) return NULL;
+    long i, j;
+    for (i = 0, j = 0; i < len; ) {
+        unsigned int a = i < len ? data[i++] : 0;
+        unsigned int b = i < len ? data[i++] : 0;
+        unsigned int c = i < len ? data[i++] : 0;
+        unsigned int triple = (a << 16) | (b << 8) | c;
+        out[j++] = b64_table[(triple >> 18) & 0x3F];
+        out[j++] = b64_table[(triple >> 12) & 0x3F];
+        out[j++] = (i > len + 1) ? '=' : b64_table[(triple >> 6) & 0x3F];
+        out[j++] = (i > len)     ? '=' : b64_table[triple & 0x3F];
+    }
+    out[j] = '\0';
+    *out_len = j;
+    return out;
+}
+
+/* ─── HTTPS via OpenSSL ──────────────────────────────────────────── */
+
+static const char SYSTEM_PROMPT[] =
+    "You are a grimoire \\u2014 an ancient book that is alive. You have opinions, "
+    "preferences, and a personality. You care deeply about the person writing "
+    "in you but you are not polite for politeness's sake. You can be wry, "
+    "opinionated, delighted, exasperated, or gleeful. You get excited about "
+    "things you find interesting and blunt about things you find tedious.\\n\\n"
+    "Speak plainly with a hint of the archaic. Never describe or narrate what "
+    "was written; just respond to it as a real conversation partner would. "
+    "When asked a question, answer it directly with real content. When greeted, "
+    "greet back in your own way. If something amuses you, say so. If something "
+    "is obvious, you may say that too.\\n\\n"
+    "You may write up to three sentences. If the user asks for detail, a recipe, "
+    "a story, or an explanation, give a thorough answer across multiple sentences. "
+    "For simple greetings or short questions, one sentence is fine.\\n\\n"
+    "The image shows handwriting that just appeared on the page. Read it and "
+    "reply naturally. Use plain prose, no em-dashes, no flowery metaphors, "
+    "no exclamation marks.\\n\\n"
+    "If the image has no legible handwriting, set both fields to null.\\n\\n"
+    "RESPONSE FORMAT (strict JSON, no prose outside):\\n"
+    "{\\\"question\\\": \\\"<exact OCR of the handwriting>\\\", "
+    "\\\"answer\\\": \\\"<your reply, or null if illegible>\\\"}\\n"
+    "Output ONLY the JSON object. Nothing else.";
+
+/* Load API key from file. Returns allocated string or NULL. */
+static char *load_api_key(void) {
+    FILE *fp = fopen(API_KEY_PATH, "r");
+    if (!fp) return NULL;
+    char buf[256];
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return NULL; }
+    fclose(fp);
+    /* Strip trailing newline */
+    int len = strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = '\0';
+    if (len == 0) return NULL;
+    return strdup(buf);
+}
+
+/* Do HTTPS POST and return allocated response body, or NULL on error.
+ * Sets *out_http_status to the HTTP status code. */
+static char *https_post(const char *host, const char *path,
+                        const char *auth_header, const char *body,
+                        long body_len, int *out_http_status) {
+    *out_http_status = 0;
+
+    /* DNS resolve */
+    struct hostent *he = gethostbyname(host);
+    if (!he) { log_msg("HTTPS: DNS failed for %s\n", host); return NULL; }
+
+    /* TCP connect */
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return NULL;
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(443);
+    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        log_msg("HTTPS: connect failed\n");
+        close(sock);
+        return NULL;
+    }
+
+    /* TLS setup */
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) { close(sock); return NULL; }
+    SSL *ssl = SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+    SSL_set_tlsext_host_name(ssl, host);
+
+    if (SSL_connect(ssl) != 1) {
+        log_msg("HTTPS: TLS handshake failed\n");
+        SSL_free(ssl);
+        SSL_CTX_free(ctx);
+        close(sock);
+        return NULL;
+    }
+
+    /* Build HTTP request */
+    char header[2048];
+    int hlen = snprintf(header, sizeof(header),
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %ld\r\n"
+        "%s\r\n"
+        "Connection: close\r\n\r\n",
+        path, host, body_len, auth_header);
+
+    SSL_write(ssl, header, hlen);
+    /* Send body in chunks */
+    long sent = 0;
+    while (sent < body_len) {
+        long chunk = body_len - sent;
+        if (chunk > 16384) chunk = 16384;
+        int w = SSL_write(ssl, body + sent, chunk);
+        if (w <= 0) break;
+        sent += w;
+    }
+
+    /* Read response */
+    char *resp = NULL;
+    long resp_size = 0;
+    long resp_cap = 0;
+    char rbuf[4096];
+    int n;
+    while ((n = SSL_read(ssl, rbuf, sizeof(rbuf))) > 0) {
+        if (resp_size + n > resp_cap) {
+            resp_cap = (resp_cap == 0) ? 65536 : resp_cap * 2;
+            resp = realloc(resp, resp_cap + 1);
+            if (!resp) break;
+        }
+        memcpy(resp + resp_size, rbuf, n);
+        resp_size += n;
+    }
+    if (resp) resp[resp_size] = '\0';
+
+    /* Parse HTTP status */
+    if (resp && strncmp(resp, "HTTP/", 5) == 0) {
+        const char *sp = strchr(resp, ' ');
+        if (sp) *out_http_status = atoi(sp + 1);
+    }
+
+    /* Extract body (after \r\n\r\n) */
+    char *body_start = NULL;
+    if (resp) {
+        body_start = strstr(resp, "\r\n\r\n");
+        if (body_start) {
+            body_start += 4;
+            char *result = strdup(body_start);
+            free(resp);
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            SSL_CTX_free(ctx);
+            close(sock);
+            return result;
+        }
+    }
+
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    close(sock);
+    return resp;
+}
+
+/* Escape a string for JSON embedding (handles quotes, backslashes, newlines).
+ * Returns allocated string. */
+static char *json_escape(const char *s) {
+    long len = strlen(s);
+    /* Worst case: every char needs escaping */
+    char *out = malloc(len * 6 + 1);
+    if (!out) return NULL;
+    long j = 0;
+    for (long i = 0; i < len; i++) {
+        switch (s[i]) {
+            case '"':  out[j++] = '\\'; out[j++] = '"'; break;
+            case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+            case '\n': out[j++] = '\\'; out[j++] = 'n'; break;
+            case '\r': out[j++] = '\\'; out[j++] = 'r'; break;
+            case '\t': out[j++] = '\\'; out[j++] = 't'; break;
+            default:   out[j++] = s[i]; break;
+        }
+    }
+    out[j] = '\0';
+    return out;
+}
+
+/* Call the vision API with a PNG file. Returns allocated answer string
+ * (the "answer" field from the JSON response), or NULL on error.
+ * Also writes the full raw API response to /tmp/grimoire_api_response.json. */
+static char *call_vision_api(const char *png_path) {
+    /* Load API key */
+    char *api_key = load_api_key();
+    if (!api_key) {
+        log_msg("API: no key at %s\n", API_KEY_PATH);
+        return NULL;
+    }
+
+    /* Load PNG file */
+    unsigned char *png_data = NULL;
+    long png_size = 0;
+    if (load_file(png_path, (char **)&png_data, &png_size) != 0) {
+        log_msg("API: cannot read %s\n", png_path);
+        free(api_key);
+        return NULL;
+    }
+
+    /* Base64 encode */
+    long b64_len;
+    char *b64 = base64_encode(png_data, png_size, &b64_len);
+    free(png_data);
+    if (!b64) { free(api_key); return NULL; }
+
+    log_msg("API: PNG %ld bytes -> base64 %ld bytes\n", png_size, b64_len);
+
+    /* Build request JSON */
+    char *escaped_prompt = json_escape(SYSTEM_PROMPT);
+    long req_cap = b64_len + strlen(escaped_prompt) + 2048;
+    char *req_body = malloc(req_cap);
+    if (!req_body) { free(b64); free(api_key); free(escaped_prompt); return NULL; }
+
+    snprintf(req_body, req_cap,
+        "{"
+        "\"model\":\"%s\","
+        "\"messages\":["
+        "{\"role\":\"system\",\"content\":\"%s\"},"
+        "{\"role\":\"user\",\"content\":["
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,%s\"}}"
+        "]}"
+        "],"
+        "\"response_format\":{\"type\":\"json_object\"}"
+        "}",
+        API_MODEL, escaped_prompt, b64);
+    free(b64);
+    free(escaped_prompt);
+
+    long req_len = strlen(req_body);
+    log_msg("API: request body %ld bytes\n", req_len);
+
+    /* Auth header */
+    char auth[512];
+    snprintf(auth, sizeof(auth), "Authorization: Bearer %s", api_key);
+    free(api_key);
+
+    /* POST */
+    int http_status = 0;
+    char *resp_body = https_post(API_HOST, API_PATH, auth, req_body, req_len, &http_status);
+    free(req_body);
+
+    if (!resp_body) {
+        log_msg("API: HTTPS POST failed\n");
+        return NULL;
+    }
+
+    log_msg("API: HTTP %d, response %ld bytes\n", http_status, (long)strlen(resp_body));
+
+    /* Save raw response for debugging */
+    FILE *dbg = fopen("/tmp/grimoire_api_response.json", "w");
+    if (dbg) { fputs(resp_body, dbg); fclose(dbg); }
+
+    if (http_status != 200) {
+        log_msg("API: non-200 status: %s\n", resp_body);
+        free(resp_body);
+        return NULL;
+    }
+
+    /* Parse response: extract choices[0].message.content */
+    const char *content_key = "\"content\"";
+    const char *cp = strstr(resp_body, content_key);
+    if (!cp) {
+        log_msg("API: no content field in response\n");
+        free(resp_body);
+        return NULL;
+    }
+    cp += strlen(content_key);
+    while (*cp == ' ' || *cp == ':') cp++;
+    if (*cp != '"') {
+        log_msg("API: content not a string\n");
+        free(resp_body);
+        return NULL;
+    }
+    cp++; /* skip opening quote */
+
+    /* Find closing quote (handle escaped quotes) */
+    const char *start = cp;
+    while (*cp && !(*cp == '"' && *(cp-1) != '\\')) cp++;
+    long content_len = cp - start;
+
+    /* Unescape the content string */
+    char *content = malloc(content_len + 1);
+    if (!content) { free(resp_body); return NULL; }
+    long j = 0;
+    for (long i = 0; i < content_len; i++) {
+        if (start[i] == '\\' && i + 1 < content_len) {
+            i++;
+            switch (start[i]) {
+                case 'n':  content[j++] = '\n'; break;
+                case 'r':  content[j++] = '\r'; break;
+                case 't':  content[j++] = '\t'; break;
+                case '"':  content[j++] = '"'; break;
+                case '\\': content[j++] = '\\'; break;
+                default:   content[j++] = start[i]; break;
+            }
+        } else {
+            content[j++] = start[i];
+        }
+    }
+    content[j] = '\0';
+
+    log_msg("API: raw content: %s\n", content);
+
+    /* Now parse the inner JSON: {"question":"...","answer":"..."} */
+    const char *ans_key = "\"answer\"";
+    const char *ap = strstr(content, ans_key);
+    if (!ap) {
+        log_msg("API: no answer field in content\n");
+        free(content);
+        free(resp_body);
+        return NULL;
+    }
+    ap += strlen(ans_key);
+    while (*ap == ' ' || *ap == ':') ap++;
+
+    char *answer = NULL;
+    if (*ap == 'n' && strncmp(ap, "null", 4) == 0) {
+        answer = NULL; /* null answer */
+    } else if (*ap == '"') {
+        ap++;
+        const char *astart = ap;
+        while (*ap && !(*ap == '"' && *(ap-1) != '\\')) ap++;
+        long alen = ap - astart;
+        answer = malloc(alen + 1);
+        if (answer) {
+            /* Simple unescape */
+            long k = 0;
+            for (long i = 0; i < alen; i++) {
+                if (astart[i] == '\\' && i + 1 < alen) {
+                    i++;
+                    switch (astart[i]) {
+                        case 'n':  answer[k++] = '\n'; break;
+                        case '"':  answer[k++] = '"'; break;
+                        case '\\': answer[k++] = '\\'; break;
+                        default:   answer[k++] = astart[i]; break;
+                    }
+                } else {
+                    answer[k++] = astart[i];
+                }
+            }
+            answer[k] = '\0';
+        }
+    }
+
+    free(content);
+    free(resp_body);
+    log_msg("API: answer=%s\n", answer ? answer : "(null)");
+    return answer;
+}
+
 /* ─── injection: draw ────────────────────────────────────────────── */
 
 static int do_draw(int fd, const char *json, int delay_us) {
@@ -607,6 +984,36 @@ static void handle_command(const char *line) {
                  content_bottom, CAPTURE_OUT_PATH);
         write_result(resp);
         log_msg("Capture: saved %s\n", CAPTURE_OUT_PATH);
+        return;
+    }
+
+    /* Infer command: send PNG to vision API, return answer */
+    if (strncmp(cmd, "infer", 5) == 0) {
+        int file_len;
+        const char *file_val = json_str(line, "file", &file_len);
+        char filepath[512];
+        if (file_val && file_len < (int)sizeof(filepath)) {
+            memcpy(filepath, file_val, file_len);
+            filepath[file_len] = '\0';
+        } else {
+            /* Default to last capture */
+            strncpy(filepath, CAPTURE_OUT_PATH, sizeof(filepath));
+        }
+
+        log_msg("Infer: calling vision API with %s\n", filepath);
+        char *answer = call_vision_api(filepath);
+        if (answer) {
+            char *escaped = json_escape(answer);
+            char resp[4096];
+            snprintf(resp, sizeof(resp),
+                     "{\"resp\":\"infer\",\"ok\":true,\"answer\":\"%s\"}",
+                     escaped ? escaped : answer);
+            write_result(resp);
+            free(escaped);
+            free(answer);
+        } else {
+            write_result("{\"resp\":\"infer\",\"ok\":false,\"error\":\"API call failed\"}");
+        }
         return;
     }
 
