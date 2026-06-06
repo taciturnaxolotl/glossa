@@ -51,6 +51,8 @@
 #define API_HOST       "potluck.dunkirk.sh"
 #define API_PATH       "/v1/chat/completions"
 #define API_MODEL      "gpt-4.1-nano"
+#define FONT_PATH      "/home/root/EMSAllure.svg"
+#define RENDER_OUT_PATH "/tmp/grimoire_render.json"
 #define MAX_CMD      8192
 
 /* Framebuffer dimensions */
@@ -70,6 +72,11 @@
 #define GRID_SIGNATURE   68
 #define CLUSTER_WINDOW   2
 #define CLUSTER_MIN      3
+
+/* External: font renderer (font_render.c) */
+extern int render_text_to_json(const char *text, const char *output_path,
+                               float origin_x, float origin_y,
+                               const char *font_path);
 
 static int g_verbose = 0;
 static int g_dev_fd = -1;
@@ -1013,6 +1020,37 @@ static void handle_command(const char *line) {
             free(answer);
         } else {
             write_result("{\"resp\":\"infer\",\"ok\":false,\"error\":\"API call failed\"}");
+        }
+        return;
+    }
+
+    /* Render command: text → strokes JSON */
+    if (strncmp(cmd, "render", 6) == 0) {
+        int text_len;
+        const char *text_val = json_str(line, "text", &text_len);
+        if (!text_val || text_len == 0) {
+            write_result("{\"resp\":\"render\",\"ok\":false,\"error\":\"missing text\"}");
+            return;
+        }
+        char text_buf[4096];
+        if (text_len >= (int)sizeof(text_buf)) text_len = sizeof(text_buf) - 1;
+        memcpy(text_buf, text_val, text_len);
+        text_buf[text_len] = '\0';
+
+        float y = (float)json_int(line, "y", 200);
+        float x = (float)json_int(line, "x", -550);
+
+        log_msg("Render: \"%s\" at (%.0f, %.0f)\n", text_buf, x, y);
+        int strokes = render_text_to_json(text_buf, RENDER_OUT_PATH, x, y, FONT_PATH);
+        if (strokes > 0) {
+            char resp[256];
+            snprintf(resp, sizeof(resp),
+                     "{\"resp\":\"render\",\"ok\":true,\"strokes\":%d,\"file\":\"%s\"}",
+                     strokes, RENDER_OUT_PATH);
+            write_result(resp);
+            log_msg("Render: %d strokes → %s\n", strokes, RENDER_OUT_PATH);
+        } else {
+            write_result("{\"resp\":\"render\",\"ok\":false,\"error\":\"render failed\"}");
         }
         return;
     }

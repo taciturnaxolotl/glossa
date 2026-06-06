@@ -63,7 +63,7 @@ echo "=== Building grimoired ==="
 docker exec $CONTAINER bash -c '
 . /opt/codex/*/*/environment-setup-*
 cd /xovi-ext/grimoired
-$CC -o grimoired grimoired.c -O2 $CFLAGS $LDFLAGS -lpthread -lpng16 -lssl -lcrypto
+$CC -o grimoired grimoired.c font_render.c -O2 $CFLAGS $LDFLAGS -lpthread -lpng16 -lssl -lcrypto -lm
 echo "grimoired built OK"
 '
 
@@ -77,6 +77,7 @@ ssh remarkable 'killall uinject 2>/dev/null; killall uinjectd 2>/dev/null; killa
 scp "$UINJECT_DIR/uinject" remarkable:/home/root/uinject
 scp "$UINJECTD_DIR/uinjectd" remarkable:/home/root/uinjectd
 scp "$GRIMOIRED_DIR/grimoired" remarkable:/home/root/grimoired
+scp "$(dirname "$0")/../fonts/EMSAllure.svg" remarkable:/home/root/EMSAllure.svg
 ssh remarkable '/home/root/uinjectd &'
 ssh remarkable '/home/root/grimoired &'
 
