@@ -13,8 +13,10 @@ Makefile
 
 # Compiled binaries
 xovi-ext/uinject/uinject
+xovi-ext/uinjectd/uinjectd
 xovi-ext/grimoire-injector/uinject
 xovi-ext/grimoire-injector/grimoire-injector.so
+xovi-ext/probe_touch
 
 # Cloned repos (reference only)
 xovi-ext/xovi/

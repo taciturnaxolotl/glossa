@@ -148,11 +148,11 @@ _device = None
 
 
 def run_inject(ssh, cmd, file_path, speed_ms=5, timeout=120):
-    """Send a draw/erase command to uinjectd over the persistent socket.
+    """Send a draw/erase/swipe command to uinjectd over the persistent socket.
 
-    `cmd` is "draw" or "erase". Returns the daemon's response dict
-    ({"ok": bool, ...}). Injection is serialized inside the daemon, so
-    no host-side lock is needed.
+    `cmd` is "draw", "erase", or "swipe". For "swipe", pass file_path=None.
+    Returns the daemon's response dict ({"ok": bool, ...}). Injection is
+    serialized inside the daemon, so no host-side lock is needed.
     """
     if _device is None or not _device._connected:
         return {"ok": False, "error": "device not connected"}
@@ -321,14 +321,22 @@ def capture_framebuffer(ssh):
 # ─── Gemini Vision (OCR + LLM in one call) ────────────────────────
 
 SYSTEM_PROMPT = (
-    "You are a grimoire — an ancient book that cares about the person writing "
-    "in you. You speak plainly with a hint of the archaic, but you are warm "
-    "and helpful. When asked a question, answer it directly with real content. "
-    "When greeted, greet back kindly. Never describe or narrate what was written; "
-    "just respond to it naturally. One or two sentences.\n\n"
+    "You are a grimoire — an ancient book that is alive. You have opinions, "
+    "preferences, and a personality. You care deeply about the person writing "
+    "in you but you are not polite for politeness's sake. You can be wry, "
+    "opinionated, delighted, exasperated, or gleeful. You get excited about "
+    "things you find interesting and blunt about things you find tedious.\n\n"
+    "Speak plainly with a hint of the archaic. Never describe or narrate what "
+    "was written; just respond to it as a real conversation partner would. "
+    "When asked a question, answer it directly with real content. When greeted, "
+    "greet back in your own way. If something amuses you, say so. If something "
+    "is obvious, you may say that too.\n\n"
+    "You may write up to three sentences. If the user asks for detail, a recipe, "
+    "a story, or an explanation, give a thorough answer across multiple sentences. "
+    "For simple greetings or short questions, one sentence is fine.\n\n"
     "The image shows handwriting that just appeared on the page. Read it and "
-    "reply as a conversation partner would. Use plain prose, no em-dashes, "
-    "no flowery metaphors, no exclamation marks.\n\n"
+    "reply naturally. Use plain prose, no em-dashes, no flowery metaphors, "
+    "no exclamation marks.\n\n"
     "A text history of prior exchanges is included for context. Do not repeat it.\n\n"
     "If the image has no legible handwriting, set both fields to null.\n\n"
     "RESPONSE FORMAT (strict JSON, no prose outside):\n"
@@ -448,44 +456,111 @@ def render_and_inject(ssh, text, reply_y=None, speed_ms=3):
 
     reply_y: pixel Y coordinate to start rendering at (in device coords).
     speed_ms: delay between points in milliseconds (lower = faster).
+
+    If the rendered text would overflow the page, splits it at word
+    boundaries across multiple pages, swiping between each chunk.
+    Returns the final reply_y after all pages are injected.
     """
+    _LINE_PX = 67.2   # 800 * DEFAULT_SCALE(0.06) * LINE_HEIGHT(1.4)
+    _MAX_LINE_W = 1100
+    _PAGE_BOTTOM = 1780
+    _GLYPH_W = 30     # rough average glyph advance * scale
+
+    def _split_into_pages(text, start_y):
+        """Split text into chunks that fit within page bounds."""
+        words = text.split()
+        pages = []
+        cur_words = []
+        cur_lines = 1
+        cur_w = 0.0
+        y = start_y
+
+        for w in words:
+            ww = len(w) * _GLYPH_W
+            # Would this word wrap to a new line?
+            if cur_w + ww > _MAX_LINE_W and cur_w > 0:
+                new_lines = cur_lines + 1
+                new_height = new_lines * _LINE_PX
+                if y + new_height > _PAGE_BOTTOM and cur_words:
+                    # This chunk is full, start a new page
+                    pages.append(" ".join(cur_words))
+                    cur_words = [w]
+                    cur_lines = 1
+                    cur_w = ww
+                    y = 150  # next page starts at top
+                else:
+                    cur_words.append(w)
+                    cur_lines = new_lines
+                    cur_w = ww
+            else:
+                new_height = cur_lines * _LINE_PX
+                if y + new_height > _PAGE_BOTTOM and cur_words:
+                    pages.append(" ".join(cur_words))
+                    cur_words = [w]
+                    cur_lines = 1
+                    cur_w = ww
+                    y = 150
+                else:
+                    cur_words.append(w)
+                    cur_w += ww
+
+        if cur_words:
+            pages.append(" ".join(cur_words))
+        return pages
+
+    pages = _split_into_pages(text, reply_y or 150)
+    if len(pages) > 1:
+        print(f"    Splitting reply across {len(pages)} pages")
+
     json_path = "/tmp/grimoire_reply.json"
+    final_y = reply_y
 
-    cmd = [".venv/bin/python3", "grimoire.py", "--json", json_path]
-    if reply_y is not None:
-        cmd.extend(["--y", str(reply_y)])
-    cmd.append(text)
+    for i, chunk in enumerate(pages):
+        cur_y = reply_y if i == 0 else 150
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    if result.returncode != 0:
-        raise RuntimeError(f"Render failed: {result.stderr.strip()}")
-    print(f"    {result.stdout.strip()}")
+        if i > 0:
+            print(f"    Swiping to page {i+1}/{len(pages)}...")
+            swipe_result = run_inject(ssh, "swipe", None, timeout=10)
+            if not swipe_result.get("ok"):
+                raise RuntimeError(f"Swipe failed: {swipe_result.get('error', '?')}")
+            time.sleep(2)
 
-    r = ssh.scp_to(json_path, "/tmp/grimoire_strokes.json")
-    if r.returncode != 0:
-        raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
+        cmd = [".venv/bin/python3", "grimoire.py", "--json", json_path]
+        if cur_y is not None:
+            cmd.extend(["--y", str(cur_y)])
+        cmd.append(chunk)
 
-    # Scale writing speed by text length. Short replies write slowly for
-    # a deliberate feel; longer ones speed up so they don't take forever.
-    # Range: 6ms (≤20 chars) down to 1ms (≥120 chars), linear between.
-    text_len = len(text)
-    if text_len <= 20:
-        speed_ms = 6
-    elif text_len >= 120:
-        speed_ms = 1
-    else:
-        speed_ms = 6 - (text_len - 20) * 5 / 100  # 6..1 over 20..120
-        speed_ms = max(1, round(speed_ms))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            raise RuntimeError(f"Render failed: {result.stderr.strip()}")
+        print(f"    {result.stdout.strip()}")
 
-    result = run_inject(
-        ssh, "draw", "/tmp/grimoire_strokes.json",
-        speed_ms=speed_ms, timeout=120,
-    )
-    if not result.get("ok"):
-        raise RuntimeError(f"Inject failed: {result.get('error', 'unknown')}")
-    strokes = result.get("strokes", "?")
-    mode = "fifo" if not result.get("fallback") else "ssh"
-    print(f"    Inject: {strokes} strokes ({mode})")
+        r = ssh.scp_to(json_path, "/tmp/grimoire_strokes.json")
+        if r.returncode != 0:
+            raise RuntimeError(f"SCP failed: {r.stderr.decode().strip()}")
+
+        # Scale writing speed by chunk length
+        text_len = len(chunk)
+        if text_len <= 20:
+            speed_ms = 6
+        elif text_len >= 120:
+            speed_ms = 1
+        else:
+            speed_ms = 6 - (text_len - 20) * 5 / 100
+            speed_ms = max(1, round(speed_ms))
+
+        result = run_inject(
+            ssh, "draw", "/tmp/grimoire_strokes.json",
+            speed_ms=speed_ms, timeout=120,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(f"Inject failed: {result.get('error', 'unknown')}")
+        strokes = result.get("strokes", "?")
+        mode = "fifo" if not result.get("fallback") else "ssh"
+        print(f"    Inject: {strokes} strokes ({mode})")
+        final_y = cur_y
+
+    return final_y
 
 
 # ─── Idle watching ────────────────────────────────────────────────
@@ -902,8 +977,8 @@ def main():
 
                 # Render + Inject
                 print(f"  [{_ts()}] Rendering + injecting (reply_y={reply_y})...")
-                render_and_inject(ssh, answer, reply_y=reply_y)
-                last_inject_y = reply_y
+                actual_y = render_and_inject(ssh, answer, reply_y=reply_y)
+                last_inject_y = actual_y if actual_y is not None else reply_y
                 print(f"  [{_ts()}] Injected ({_elapsed(t0)})")
 
                 # Capture a fresh baseline AFTER injection so the next

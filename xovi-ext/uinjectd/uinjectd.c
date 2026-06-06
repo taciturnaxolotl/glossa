@@ -39,6 +39,7 @@
 #include <signal.h>
 
 #define DEV_PATH   "/dev/input/event1"
+#define TOUCH_PATH "/dev/input/event2"
 #define IDLE_PATH  "/tmp/grimoire_idle"
 #define DEFAULT_PORT 9999
 #define MAX_CMD    4096
@@ -294,6 +295,47 @@ static int do_erase(int fd, const char *json, int delay_us) {
     return total_emitted;
 }
 
+/* ─── page swipe (touchscreen MT-B) ─────────────────────────────── */
+
+static int do_swipe_page(void) {
+    int fd = open(TOUCH_PATH, O_WRONLY);
+    if (fd < 0) { vlog("swipe: open %s failed\n", TOUCH_PATH); return -1; }
+
+    /* Right-to-left swipe across bottom third of screen (next page).
+     * Touch coords match display: X 0-1403, Y 0-1871.
+     * Swipe from (1200, 1400) to (200, 1400) in ~20 steps. */
+    const int x0 = 1200, x1 = 200, y = 1400;
+    const int steps = 20;
+    const int step_delay = 8000;  /* 8ms per step = ~160ms total */
+
+    /* Slot 0, tracking ID 1 */
+    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
+    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, 1);
+    emit_event(fd, EV_ABS, ABS_MT_POSITION_X, x0);
+    emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
+    emit_event(fd, EV_ABS, ABS_MT_PRESSURE, 128);
+    emit_syn(fd);
+    usleep(step_delay);
+
+    for (int i = 1; i <= steps; i++) {
+        int cx = x0 + (x1 - x0) * i / steps;
+        emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
+        emit_event(fd, EV_ABS, ABS_MT_POSITION_X, cx);
+        emit_event(fd, EV_ABS, ABS_MT_POSITION_Y, y);
+        emit_syn(fd);
+        usleep(step_delay);
+    }
+
+    /* Release: tracking ID = -1 */
+    emit_event(fd, EV_ABS, ABS_MT_SLOT, 0);
+    emit_event(fd, EV_ABS, ABS_MT_TRACKING_ID, -1);
+    emit_syn(fd);
+
+    close(fd);
+    vlog("Swipe page done\n");
+    return 0;
+}
+
 /* ─── command handling ───────────────────────────────────────────── */
 
 static void handle_command(const char *line) {
@@ -306,6 +348,17 @@ static void handle_command(const char *line) {
 
     if (strncmp(cmd, "ping", 4) == 0) {
         send_line("{\"resp\":\"ping\",\"ok\":true}");
+        return;
+    }
+
+    if (strncmp(cmd, "swipe", 5) == 0) {
+        pthread_mutex_lock(&g_inject_lock);
+        int ret = do_swipe_page();
+        pthread_mutex_unlock(&g_inject_lock);
+        if (ret == 0)
+            send_line("{\"resp\":\"swipe\",\"ok\":true}");
+        else
+            send_line("{\"resp\":\"swipe\",\"ok\":false,\"error\":\"touch open failed\"}");
         return;
     }
 

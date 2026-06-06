@@ -1,11 +1,12 @@
 #!/bin/bash
-# Build all grimoire xovi components: extension .so + uinject binary
+# Build all grimoire xovi components: extension .so + uinject + uinjectd
 set -e
 cd "$(dirname "$0")"
 
 CONTAINER="grimoire-builder"
 EXT_DIR="$(pwd)/grimoire-injector"
 UINJECT_DIR="$(pwd)/uinject"
+UINJECTD_DIR="$(pwd)/uinjectd"
 
 # Create persistent builder container if needed
 if ! docker inspect $CONTAINER &>/dev/null; then
@@ -44,9 +45,24 @@ echo "uinject built OK"
 echo "Copying uinject..."
 docker cp $CONTAINER:/xovi-ext/uinject/uinject "$UINJECT_DIR/"
 
-# Deploy both to device
+# Build uinjectd
+echo "=== Building uinjectd ==="
+docker exec $CONTAINER bash -c '
+. /opt/codex/*/*/environment-setup-*
+cd /xovi-ext/uinjectd
+$CC -o uinjectd uinjectd.c -O2 $CFLAGS $LDFLAGS -lpthread
+echo "uinjectd built OK"
+'
+
+echo "Copying uinjectd..."
+docker cp $CONTAINER:/xovi-ext/uinjectd/uinjectd "$UINJECTD_DIR/"
+
+# Deploy all to device
 echo "=== Deploying to device ==="
 scp "$EXT_DIR/grimoire-injector.so" remarkable:/home/root/xovi/extensions.d/
+ssh remarkable 'killall uinject 2>/dev/null; killall uinjectd 2>/dev/null; rm -f /home/root/uinject /home/root/uinjectd'
 scp "$UINJECT_DIR/uinject" remarkable:/home/root/uinject
+scp "$UINJECTD_DIR/uinjectd" remarkable:/home/root/uinjectd
+ssh remarkable '/home/root/uinjectd &'
 
 echo "Done! Restart xochitl to load new extension."
