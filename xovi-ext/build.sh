@@ -63,7 +63,7 @@ echo "=== Building grimoired ==="
 docker exec $CONTAINER bash -c '
 . /opt/codex/*/*/environment-setup-*
 cd /xovi-ext/grimoired
-$CC -o grimoired grimoired.c -O2 $CFLAGS $LDFLAGS -lpthread
+$CC -o grimoired grimoired.c -O2 $CFLAGS $LDFLAGS -lpthread -lpng16
 echo "grimoired built OK"
 '
 

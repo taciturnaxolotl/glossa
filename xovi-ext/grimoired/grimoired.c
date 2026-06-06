@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <png.h>
 
 #define DEV_PATH     "/dev/input/event1"
 #define TOUCH_PATH   "/dev/input/event2"
@@ -38,7 +39,28 @@
 #define CMD_PATH     "/tmp/grimoire_cmd"
 #define RESULT_PATH  "/tmp/grimoire_result"
 #define LOG_PATH     "/tmp/grimoired.log"
+#define FB_RAW_PATH  "/tmp/grimoire_fb.raw"
+#define SCREENSHOT_TRIGGER "/tmp/grimoire_screenshot"
+#define CAPTURE_OUT_PATH "/tmp/grimoire_capture.png"
 #define MAX_CMD      8192
+
+/* Framebuffer dimensions */
+#define FB_WIDTH     1404
+#define FB_HEIGHT    1872
+#define FB_BPP       4
+#define FB_SIZE      (FB_WIDTH * FB_HEIGHT * FB_BPP)
+
+/* Crop parameters (match Python loop) */
+#define CROP_TOP     80
+#define CROP_BOTTOM  200
+#define CROP_HEIGHT  (FB_HEIGHT - CROP_TOP - CROP_BOTTOM)
+
+/* Grid artifact filter constants */
+#define DARK_THRESHOLD   128
+#define MIN_DARK_PIXELS  5
+#define GRID_SIGNATURE   68
+#define CLUSTER_WINDOW   2
+#define CLUSTER_MIN      3
 
 static int g_verbose = 0;
 static int g_dev_fd = -1;
@@ -163,6 +185,179 @@ static void write_result(const char *msg) {
         fputc('\n', fp);
         fclose(fp);
     }
+}
+
+/* ─── image pipeline (Phase 2) ───────────────────────────────────── */
+
+/* Read raw framebuffer into allocated buffer. Returns NULL on failure. */
+static unsigned char *read_framebuffer(void) {
+    FILE *fp = fopen(FB_RAW_PATH, "rb");
+    if (!fp) return NULL;
+    unsigned char *buf = malloc(FB_SIZE);
+    if (!buf) { fclose(fp); return NULL; }
+    size_t n = fread(buf, 1, FB_SIZE, fp);
+    fclose(fp);
+    if ((long)n < FB_SIZE) { free(buf); return NULL; }
+    return buf;
+}
+
+/* Convert RGBA pixel to grayscale luminance */
+static inline unsigned char rgba_to_gray(const unsigned char *px) {
+    /* Standard luminance: 0.299R + 0.587G + 0.114B */
+    return (unsigned char)((px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8);
+}
+
+/* Count dark pixels in a row of the cropped region.
+ * Row index is relative to the crop (0 = CROP_TOP in raw FB). */
+static int count_dark_in_row(const unsigned char *fb, int row) {
+    int raw_y = row + CROP_TOP;
+    if (raw_y < 0 || raw_y >= FB_HEIGHT) return 0;
+    const unsigned char *row_ptr = fb + raw_y * FB_WIDTH * FB_BPP;
+    int count = 0;
+    for (int x = 0; x < FB_WIDTH; x++) {
+        if (rgba_to_gray(row_ptr + x * FB_BPP) < DARK_THRESHOLD)
+            count++;
+    }
+    return count;
+}
+
+/* Check if page has no real handwriting (only grid dots or blank).
+ * Ported from Python _page_is_empty with grid artifact filter. */
+static int page_is_empty(const unsigned char *fb) {
+    int num_rows = CROP_HEIGHT;
+    unsigned char *candidate = calloc(num_rows, 1);
+    if (!candidate) return 1;
+
+    for (int y = 0; y < num_rows; y++) {
+        int dark = count_dark_in_row(fb, y);
+        candidate[y] = (dark > MIN_DARK_PIXELS && dark != GRID_SIGNATURE) ? 1 : 0;
+    }
+
+    /* Check for clusters: any candidate row with >= CLUSTER_MIN neighbors
+     * within ±CLUSTER_WINDOW means real content exists */
+    for (int y = 0; y < num_rows; y++) {
+        if (!candidate[y]) continue;
+        int cluster = 0;
+        for (int dy = -CLUSTER_WINDOW; dy <= CLUSTER_WINDOW; dy++) {
+            int ny = y + dy;
+            if (ny >= 0 && ny < num_rows && candidate[ny])
+                cluster++;
+        }
+        if (cluster >= CLUSTER_MIN) {
+            free(candidate);
+            return 0;  /* Not empty */
+        }
+    }
+
+    free(candidate);
+    return 1;  /* Empty */
+}
+
+/* Find the bottom of real content in the cropped region.
+ * Returns the Y coordinate (in raw FB space) of the content bottom,
+ * or 0 if no content found. Uses grid-artifact filter. */
+static int find_content_bottom(const unsigned char *fb) {
+    int num_rows = CROP_HEIGHT;
+    unsigned char *candidate = calloc(num_rows, 1);
+    if (!candidate) return 0;
+
+    for (int y = 0; y < num_rows; y++) {
+        int dark = count_dark_in_row(fb, y);
+        candidate[y] = (dark > MIN_DARK_PIXELS && dark != GRID_SIGNATURE) ? 1 : 0;
+    }
+
+    /* Find the lowest row that's part of a real cluster */
+    int bottom_crop_y = -1;
+    for (int y = num_rows - 1; y >= 0; y--) {
+        if (!candidate[y]) continue;
+        int cluster = 0;
+        for (int dy = -CLUSTER_WINDOW; dy <= CLUSTER_WINDOW; dy++) {
+            int ny = y + dy;
+            if (ny >= 0 && ny < num_rows && candidate[ny])
+                cluster++;
+        }
+        if (cluster >= CLUSTER_MIN) {
+            bottom_crop_y = y;
+            break;
+        }
+    }
+
+    free(candidate);
+    if (bottom_crop_y < 0) return 0;
+
+    /* Add padding and convert back to raw FB coordinates */
+    int bottom_raw = bottom_crop_y + CROP_TOP + 30;
+    if (bottom_raw >= FB_HEIGHT - CROP_BOTTOM)
+        bottom_raw = FB_HEIGHT - CROP_BOTTOM - 1;
+    return bottom_raw;
+}
+
+/* Save cropped region as grayscale PNG via libpng.
+ * Crops top CROP_TOP and bottom CROP_BOTTOM rows from raw FB. */
+static int save_cropped_png(const unsigned char *fb, const char *path) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return -1;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING,
+                                               NULL, NULL, NULL);
+    if (!png) { fclose(fp); return -1; }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) { png_destroy_write_struct(&png, NULL); fclose(fp); return -1; }
+
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return -1;
+    }
+
+    png_init_io(png, fp);
+    png_set_IHDR(png, info, FB_WIDTH, CROP_HEIGHT, 8,
+                 PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE,
+                 PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    png_write_info(png, info);
+
+    /* Write row by row, converting RGBA to grayscale */
+    unsigned char *row_buf = malloc(FB_WIDTH);
+    if (!row_buf) {
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
+        return -1;
+    }
+
+    for (int y = 0; y < CROP_HEIGHT; y++) {
+        int raw_y = y + CROP_TOP;
+        const unsigned char *src = fb + raw_y * FB_WIDTH * FB_BPP;
+        for (int x = 0; x < FB_WIDTH; x++) {
+            row_buf[x] = rgba_to_gray(src + x * FB_BPP);
+        }
+        png_write_row(png, row_buf);
+    }
+
+    png_write_end(png, NULL);
+    free(row_buf);
+    png_destroy_write_struct(&png, &info);
+    fclose(fp);
+    return 0;
+}
+
+/* Trigger framebuffer capture via xovi extension and wait for dump.
+ * Returns allocated raw FB buffer, or NULL on timeout. */
+static unsigned char *trigger_and_read_fb(void) {
+    /* Remove old dump and trigger new one */
+    unlink(FB_RAW_PATH);
+    int tf = open(SCREENSHOT_TRIGGER, O_CREAT|O_WRONLY, 0644);
+    if (tf >= 0) close(tf);
+
+    /* Wait for dump (xovi watch thread checks every ~1s worst case) */
+    for (int i = 0; i < 30; i++) {
+        usleep(100000);  /* 100ms polls */
+        struct stat st;
+        if (stat(FB_RAW_PATH, &st) == 0 && st.st_size >= FB_SIZE) {
+            return read_framebuffer();
+        }
+    }
+    return NULL;
 }
 
 /* ─── injection: draw ────────────────────────────────────────────── */
@@ -375,6 +570,43 @@ static void handle_command(const char *line) {
     const char *cmd = json_str(line, "cmd", &cmd_len);
     if (!cmd) {
         write_result("{\"resp\":\"?\",\"ok\":false,\"error\":\"missing cmd\"}");
+        return;
+    }
+
+    /* Capture command: trigger screenshot, process, save PNG */
+    if (strncmp(cmd, "capture", 7) == 0) {
+        log_msg("Capture: triggering framebuffer dump\n");
+        unsigned char *fb = trigger_and_read_fb();
+        if (!fb) {
+            write_result("{\"resp\":\"capture\",\"ok\":false,\"error\":\"timeout\"}");
+            return;
+        }
+
+        int empty = page_is_empty(fb);
+        int content_bottom = find_content_bottom(fb);
+        log_msg("Capture: empty=%d content_bottom=%d\n", empty, content_bottom);
+
+        if (empty) {
+            free(fb);
+            write_result("{\"resp\":\"capture\",\"ok\":true,\"empty\":true,\"content_bottom\":0}");
+            return;
+        }
+
+        /* Save cropped PNG */
+        if (save_cropped_png(fb, CAPTURE_OUT_PATH) != 0) {
+            free(fb);
+            write_result("{\"resp\":\"capture\",\"ok\":false,\"error\":\"png write failed\"}");
+            return;
+        }
+
+        free(fb);
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+                 "{\"resp\":\"capture\",\"ok\":true,\"empty\":false,"
+                 "\"content_bottom\":%d,\"file\":\"%s\"}",
+                 content_bottom, CAPTURE_OUT_PATH);
+        write_result(resp);
+        log_msg("Capture: saved %s\n", CAPTURE_OUT_PATH);
         return;
     }
 
