@@ -1115,10 +1115,13 @@ static void handle_command(const char *line) {
 static int read_armed_state(void) {
     FILE *fp = fopen(ARMED_PATH, "r");
     if (!fp) return 0;
-    int val = 0;
-    fscanf(fp, "%d", &val);
+    char buf[16] = {0};
+    if (!fgets(buf, sizeof(buf), fp)) { fclose(fp); return 0; }
     fclose(fp);
-    return val != 0;
+    /* Handle JSON-quoted values from rmhWriteFile ("1" or "0") */
+    char *p = buf;
+    while (*p == '"' || *p == ' ' || *p == '\t') p++;
+    return atoi(p) != 0;
 }
 
 /* ─── main loop ──────────────────────────────────────────────────── */

@@ -77,9 +77,31 @@ static void *watchThreadFunc(void *) {
     }
 
     const char *path = "/tmp/grimoire_strokes.json";
+    const char *armedPath = "/tmp/grimoire_armed";
     long long lastMod = 0;
+    int lastArmed = -1;
 
     while (true) {
+        /* Check armed state file */
+        FILE *afp = fopen(armedPath, "r");
+        if (afp) {
+            char abuf[16] = {0};
+            if (fgets(abuf, sizeof(abuf), afp)) {
+                char *ap = abuf;
+                while (*ap == '"' || *ap == ' ' || *ap == '\t') ap++;
+                int val = atoi(ap);
+                if (val != lastArmed && g_instance) {
+                    lastArmed = val;
+                    int capturedVal = val;
+                    QMetaObject::invokeMethod(g_instance, [capturedVal]() {
+                        g_instance->setArmed(capturedVal != 0);
+                    }, Qt::QueuedConnection);
+                    grimoire_log("Armed state changed: %d", val);
+                }
+            }
+            fclose(afp);
+        }
+
         /* Check for hot-reload signal */
         if (grimoire_checkReload()) {
             fprintf(stderr, "[grimoire] Hot-reload signal received! Re-scanning...\n");
@@ -136,6 +158,20 @@ GrimoireInjector::GrimoireInjector(QObject *parent)
     pthread_create(&tid, nullptr, watchThreadFunc, nullptr);
     pthread_detach(tid);
     fprintf(stderr, "[grimoire] Constructor done, watch thread spawned\n");
+}
+
+void GrimoireInjector::setArmed(bool armed) {
+    if (m_armed == armed) return;
+    m_armed = armed;
+
+    /* Write state file so grimoired can see it */
+    FILE *fp = fopen("/tmp/grimoire_armed", "w");
+    if (fp) {
+        fprintf(fp, "%d\n", armed ? 1 : 0);
+        fclose(fp);
+    }
+    grimoire_log("setArmed(%d)", armed);
+    emit armedChanged(armed);
 }
 
 void GrimoireInjector::loadAndInject() {
