@@ -1,7 +1,11 @@
+# Python
 .venv/
-pages/
 __pycache__/
 *.pyc
+.env
+
+# macOS
+.DS_Store
 
 # Build artifacts
 *.o
@@ -11,25 +15,28 @@ build/
 Makefile
 .qmake.stash
 
-# Compiled binaries
+# Compiled binaries (built by build.sh)
 xovi-ext/uinject/uinject
 xovi-ext/uinjectd/uinjectd
-xovi-ext/grimoire-injector/uinject
 xovi-ext/grimoire-injector/grimoire-injector.so
-xovi-ext/probe_touch
 xovi-ext/grimoired/grimoired
+xovi-ext/probe_touch
 
-# Cloned repos (reference only)
+# Cloned reference repos
 xovi-ext/xovi/
 xovi-ext/qmldiff/
 xovi-ext/clipboard-injector/
 
-# Analysis binaries
-analysis/xochitl
-analysis/hashtab
+# RE analysis binaries (large, device-specific)
+analysis/
 
-# Frida scripts (temporary)
+# Test .rm files
+pages/
+
+# Temporary/legacy scripts
 frida-explore.js
+inject.sh
 
-.env
-.DS_Store
+# AI assistant config
+.crush/
+.claude/
