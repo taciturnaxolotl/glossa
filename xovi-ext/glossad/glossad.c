@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <math.h>
 #include <png.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -70,12 +71,11 @@
 #define CROP_BOTTOM  200
 #define CROP_HEIGHT  (FB_HEIGHT - CROP_TOP - CROP_BOTTOM)
 
-/* Grid artifact filter constants */
-#define DARK_THRESHOLD   128
-#define MIN_DARK_PIXELS  5
-#define GRID_SIGNATURE   68
-#define CLUSTER_WINDOW   2
-#define CLUSTER_MIN      3
+/* Influence map constants */
+#define INFLUENCE_RADIUS   30   /* px around each stroke point */
+#define INFLUENCE_SIGMA    15.0 /* Gaussian falloff sigma */
+#define INFLUENCE_THRESH   128  /* mask threshold for blanking */
+#define DARK_THRESHOLD     128  /* pixel darkness threshold */
 
 /* External: font renderer (font_render.c) */
 extern int render_text_to_json(const char *text, const char *output_path,
@@ -91,6 +91,12 @@ static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_inject_lock = PTHREAD_MUTEX_INITIALIZER;
 static time_t g_safezone_until = 0;
 static time_t g_last_activity = 0;
+
+/* Stroke influence map: CROP_HEIGHT x FB_WIDTH, uint8.
+ * Tracks known content regions so we can mask them out of the AI crop
+ * and detect only genuinely new handwriting. Zeroed at startup,
+ * cleared on page turn. */
+static unsigned char g_influence[CROP_HEIGHT][FB_WIDTH];
 
 /* ─── logging ────────────────────────────────────────────────────── */
 
@@ -232,93 +238,230 @@ static inline unsigned char rgba_to_gray(const unsigned char *px) {
     return (unsigned char)((px[0] * 77 + px[1] * 150 + px[2] * 29) >> 8);
 }
 
-/* Count dark pixels in a row of the cropped region.
- * Row index is relative to the crop (0 = CROP_TOP in raw FB). */
-static int count_dark_in_row(const unsigned char *fb, int row) {
-    int raw_y = row + CROP_TOP;
-    if (raw_y < 0 || raw_y >= FB_HEIGHT) return 0;
-    const unsigned char *row_ptr = fb + raw_y * FB_WIDTH * FB_BPP;
-    int count = 0;
-    for (int x = 0; x < FB_WIDTH; x++) {
-        if (rgba_to_gray(row_ptr + x * FB_BPP) < DARK_THRESHOLD)
-            count++;
-    }
-    return count;
-}
+/* ─── stroke influence map ─────────────────────────────────────── */
 
-/* Check if page has no real handwriting (only grid dots or blank).
- * Ported from Python _page_is_empty with grid artifact filter. */
-static int page_is_empty(const unsigned char *fb) {
-    int num_rows = CROP_HEIGHT;
-    unsigned char *candidate = calloc(num_rows, 1);
-    if (!candidate) return 1;
+/* Mark a region around stroke points in the influence map.
+ * Points are in raw framebuffer coordinates (not crop-relative).
+ * Uses Gaussian falloff so edges blend smoothly. */
+static void mark_stroke_region(const float *points, int n_points, int stride) {
+    float sigma2x2 = 2.0f * INFLUENCE_SIGMA * INFLUENCE_SIGMA;
+    int r = INFLUENCE_RADIUS;
 
-    for (int y = 0; y < num_rows; y++) {
-        int dark = count_dark_in_row(fb, y);
-        candidate[y] = (dark > MIN_DARK_PIXELS && dark != GRID_SIGNATURE) ? 1 : 0;
-    }
+    for (int i = 0; i < n_points; i++) {
+        float px = points[i * stride];
+        float py = points[i * stride + 1];
 
-    /* Check for clusters: any candidate row with >= CLUSTER_MIN neighbors
-     * within ±CLUSTER_WINDOW means real content exists */
-    for (int y = 0; y < num_rows; y++) {
-        if (!candidate[y]) continue;
-        int cluster = 0;
-        for (int dy = -CLUSTER_WINDOW; dy <= CLUSTER_WINDOW; dy++) {
-            int ny = y + dy;
-            if (ny >= 0 && ny < num_rows && candidate[ny])
-                cluster++;
-        }
-        if (cluster >= CLUSTER_MIN) {
-            free(candidate);
-            return 0;  /* Not empty */
+        /* Convert to crop-space */
+        int cx = (int)(px + 702.0f);  /* rm x=0 is center, img x=702 is center */
+        int cy = (int)(py - CROP_TOP);
+
+        /* Bounding box in crop space, clamped */
+        int x0 = cx - r; if (x0 < 0) x0 = 0;
+        int y0 = cy - r; if (y0 < 0) y0 = 0;
+        int x1 = cx + r; if (x1 >= FB_WIDTH) x1 = FB_WIDTH - 1;
+        int y1 = cy + r; if (y1 >= CROP_HEIGHT) y1 = CROP_HEIGHT - 1;
+
+        for (int y = y0; y <= y1; y++) {
+            float dy = (float)(y - cy);
+            float dy2 = dy * dy;
+            for (int x = x0; x <= x1; x++) {
+                float dx = (float)(x - cx);
+                float dist2 = dx * dx + dy2;
+                unsigned char val = (unsigned char)(255.0f * expf(-dist2 / sigma2x2));
+                if (val > g_influence[y][x])
+                    g_influence[y][x] = val;
+            }
         }
     }
-
-    free(candidate);
-    return 1;  /* Empty */
 }
 
-/* Find the bottom of real content in the cropped region.
- * Returns the Y coordinate (in raw FB space) of the content bottom,
- * or 0 if no content found. Uses grid-artifact filter. */
-static int find_content_bottom(const unsigned char *fb) {
-    int num_rows = CROP_HEIGHT;
-    unsigned char *candidate = calloc(num_rows, 1);
-    if (!candidate) return 0;
+/* Parse stroke JSON and mark all points in the influence map.
+ * Expects the uinject JSON format: [{points:[[x,y,...],...]}, ...] */
+static void mark_strokes_from_json(const char *json) {
+    /* Simple parser: find each [x,y pair inside "points" arrays */
+    const char *p = json;
+    while ((p = strstr(p, "\"points\"")) != NULL) {
+        p = strchr(p, '[');  /* opening of points array */
+        if (!p) break;
+        p++; /* skip '[' */
 
-    for (int y = 0; y < num_rows; y++) {
-        int dark = count_dark_in_row(fb, y);
-        candidate[y] = (dark > MIN_DARK_PIXELS && dark != GRID_SIGNATURE) ? 1 : 0;
+        /* Parse [[x,y,...],[x,y,...],...] */
+        while (*p && *p != ']') {
+            if (*p == '[') {
+                float coords[6];
+                int nc = 0;
+                p++; /* skip inner '[' */
+                while (*p && *p != ']' && nc < 6) {
+                    char *end;
+                    coords[nc++] = strtof(p, &end);
+                    if (end == p) break;
+                    p = end;
+                    while (*p == ',' || *p == ' ') p++;
+                }
+                if (nc >= 2) {
+                    mark_stroke_region(coords, 1, 2);
+                }
+                /* skip to closing ']' of this point */
+                while (*p && *p != ']') p++;
+                if (*p == ']') p++;
+            } else {
+                p++;
+            }
+        }
+        if (*p == ']') p++;
     }
+}
 
-    /* Find the lowest row that's part of a real cluster */
+/* Apply influence mask to a cropped grayscale buffer: pixels in known
+ * regions are blanked to white. Used before saving PNG for the AI. */
+static void apply_influence_mask(unsigned char *gray_crop) {
+    for (int y = 0; y < CROP_HEIGHT; y++) {
+        for (int x = 0; x < FB_WIDTH; x++) {
+            if (g_influence[y][x] > INFLUENCE_THRESH)
+                gray_crop[y * FB_WIDTH + x] = 255;
+        }
+    }
+}
+
+/* Detect new content outside known regions.
+ * Returns 1 if dark pixels exist outside the influence mask, 0 otherwise.
+ * Also sets *out_bottom to the lowest row (in raw FB coords) with new content. */
+static int detect_new_content(const unsigned char *fb, int *out_bottom) {
+    int found = 0;
     int bottom_crop_y = -1;
-    for (int y = num_rows - 1; y >= 0; y--) {
-        if (!candidate[y]) continue;
-        int cluster = 0;
-        for (int dy = -CLUSTER_WINDOW; dy <= CLUSTER_WINDOW; dy++) {
-            int ny = y + dy;
-            if (ny >= 0 && ny < num_rows && candidate[ny])
-                cluster++;
-        }
-        if (cluster >= CLUSTER_MIN) {
-            bottom_crop_y = y;
-            break;
+
+    for (int y = 0; y < CROP_HEIGHT; y++) {
+        int raw_y = y + CROP_TOP;
+        const unsigned char *row_ptr = fb + raw_y * FB_WIDTH * FB_BPP;
+        for (int x = 0; x < FB_WIDTH; x++) {
+            if (g_influence[y][x] > INFLUENCE_THRESH)
+                continue;  /* known region, skip */
+            if (rgba_to_gray(row_ptr + x * FB_BPP) < DARK_THRESHOLD) {
+                found = 1;
+                bottom_crop_y = y;  /* keep scanning for lowest */
+                break;  /* one dark pixel in this row is enough */
+            }
         }
     }
 
-    free(candidate);
-    if (bottom_crop_y < 0) return 0;
+    if (out_bottom) {
+        if (bottom_crop_y >= 0) {
+            int raw = bottom_crop_y + CROP_TOP + 30;
+            if (raw >= FB_HEIGHT - CROP_BOTTOM)
+                raw = FB_HEIGHT - CROP_BOTTOM - 1;
+            *out_bottom = raw;
+        } else {
+            *out_bottom = 0;
+        }
+    }
+    return found;
+}
 
-    /* Add padding and convert back to raw FB coordinates */
-    int bottom_raw = bottom_crop_y + CROP_TOP + 30;
-    if (bottom_raw >= FB_HEIGHT - CROP_BOTTOM)
-        bottom_raw = FB_HEIGHT - CROP_BOTTOM - 1;
-    return bottom_raw;
+/* Clear the influence map (e.g. on page turn). */
+static void clear_influence_map(void) {
+    memset(g_influence, 0, sizeof(g_influence));
+}
+
+/* Despeckle: remove noise from a grayscale crop buffer.
+ * Two passes:
+ *   1. Isolated pixel removal: dark pixels with fewer than NEIGHBOR_MIN
+ *      dark 8-neighbors are e-ink noise — erase them.
+ *   2. Small component removal: connected components of dark pixels
+ *      smaller than MIN_COMPONENT_SIZE are grid artifacts or noise.
+ *      Real handwriting forms large connected blobs; grid dots are tiny. */
+#define DESPECKLE_NEIGHBOR_MIN  2
+#define MIN_COMPONENT_SIZE      4
+
+static void despeckle_crop(unsigned char *gray, int w, int h) {
+    /* Pass 1: isolated pixel removal */
+    unsigned char *tmp = malloc(w * h);
+    if (!tmp) return;
+    memcpy(tmp, gray, w * h);
+
+    for (int y = 1; y < h - 1; y++) {
+        for (int x = 1; x < w - 1; x++) {
+            if (tmp[y * w + x] >= DARK_THRESHOLD)
+                continue;
+            int dark_n = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (dx == 0 && dy == 0) continue;
+                    if (tmp[(y + dy) * w + (x + dx)] < DARK_THRESHOLD)
+                        dark_n++;
+                }
+            }
+            if (dark_n < DESPECKLE_NEIGHBOR_MIN)
+                gray[y * w + x] = 255;
+        }
+    }
+    free(tmp);
+
+    /* Pass 2: small connected-component removal via flood fill.
+     * Label each dark blob; if it has fewer than MIN_COMPONENT_SIZE
+     * pixels, blank it. Uses a simple iterative BFS with a stack. */
+    unsigned char *labels = calloc(w * h, 1);  /* 0=unvisited/bg, 1+=component id */
+    if (!labels) return;
+
+    /* Stack for flood fill: stores (y*w+x) indices */
+    int *stack = malloc(w * h * sizeof(int));
+    if (!stack) { free(labels); return; }
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (gray[y * w + x] >= DARK_THRESHOLD || labels[y * w + x])
+                continue;
+
+            /* Flood fill this component */
+            int sp = 0;
+            int count = 0;
+            stack[sp++] = y * w + x;
+            labels[y * w + x] = 1;  /* mark visited */
+
+            /* Collect all pixels in this component, tracking bounding box */
+            int start = 0;
+            int min_x = w, max_x = 0, min_y = h, max_y = 0;
+            while (start < sp) {
+                int idx = stack[start++];
+                count++;
+                int cy = idx / w, cx = idx % w;
+                if (cx < min_x) min_x = cx;
+                if (cx > max_x) max_x = cx;
+                if (cy < min_y) min_y = cy;
+                if (cy > max_y) max_y = cy;
+                for (int dy = -1; dy <= 1; dy++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (dx == 0 && dy == 0) continue;
+                        int ny = cy + dy, nx = cx + dx;
+                        if (ny < 0 || ny >= h || nx < 0 || nx >= w) continue;
+                        int ni = ny * w + nx;
+                        if (!labels[ni] && gray[ni] < DARK_THRESHOLD) {
+                            labels[ni] = 1;
+                            stack[sp++] = ni;
+                        }
+                    }
+                }
+            }
+
+            int comp_w = max_x - min_x + 1;
+            int comp_h = max_y - min_y + 1;
+
+            /* Kill if too small, OR if it matches the grid dot signature:
+             * exactly 4 pixels in a 2x2 box (paired dots on consecutive rows) */
+            if (count < MIN_COMPONENT_SIZE ||
+                (count == 4 && comp_w <= 2 && comp_h <= 2)) {
+                for (int i = 0; i < sp; i++)
+                    gray[stack[i]] = 255;
+            }
+        }
+    }
+
+    free(stack);
+    free(labels);
 }
 
 /* Save cropped region as grayscale PNG via libpng.
- * Crops top CROP_TOP and bottom CROP_BOTTOM rows from raw FB. */
+ * Crops top CROP_TOP and bottom CROP_BOTTOM rows from raw FB.
+ * Applies influence mask: known content regions are blanked to white. */
 static int save_cropped_png(const unsigned char *fb, const char *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return -1;
@@ -342,7 +485,7 @@ static int save_cropped_png(const unsigned char *fb, const char *path) {
                  PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
     png_write_info(png, info);
 
-    /* Write row by row, converting RGBA to grayscale */
+    /* Write row by row, converting RGBA to grayscale with influence mask */
     unsigned char *row_buf = malloc(FB_WIDTH);
     if (!row_buf) {
         png_destroy_write_struct(&png, &info);
@@ -354,7 +497,11 @@ static int save_cropped_png(const unsigned char *fb, const char *path) {
         int raw_y = y + CROP_TOP;
         const unsigned char *src = fb + raw_y * FB_WIDTH * FB_BPP;
         for (int x = 0; x < FB_WIDTH; x++) {
-            row_buf[x] = rgba_to_gray(src + x * FB_BPP);
+            unsigned char gray = rgba_to_gray(src + x * FB_BPP);
+            /* Blank out known content regions */
+            if (g_influence[y][x] > INFLUENCE_THRESH)
+                gray = 255;
+            row_buf[x] = gray;
         }
         png_write_row(png, row_buf);
     }
@@ -970,11 +1117,11 @@ static void handle_command(const char *line) {
             return;
         }
 
-        int empty = page_is_empty(fb);
-        int content_bottom = find_content_bottom(fb);
-        log_msg("Capture: empty=%d content_bottom=%d\n", empty, content_bottom);
+        int content_bottom = 0;
+        int has_content = detect_new_content(fb, &content_bottom);
+        log_msg("Capture: has_content=%d content_bottom=%d\n", has_content, content_bottom);
 
-        if (empty) {
+        if (!has_content) {
             free(fb);
             write_result("{\"resp\":\"capture\",\"ok\":true,\"empty\":true,\"content_bottom\":0}");
             return;
@@ -1208,24 +1355,64 @@ static void run_pipeline(void) {
         return;
     }
 
-    /* 2. Blank check */
-    if (page_is_empty(fb)) {
-        log_msg("Pipeline: page empty, clearing history\n");
-        history_clear();
-        free(fb);
-        return;
+    /* 2. Despeckle: build a grayscale crop, remove isolated pixels,
+     *    then use it for both detection and the AI PNG. */
+    unsigned char *crop_gray = malloc(FB_WIDTH * CROP_HEIGHT);
+    if (!crop_gray) { free(fb); return; }
+    for (int y = 0; y < CROP_HEIGHT; y++) {
+        const unsigned char *src = fb + (y + CROP_TOP) * FB_WIDTH * FB_BPP;
+        for (int x = 0; x < FB_WIDTH; x++)
+            crop_gray[y * FB_WIDTH + x] = rgba_to_gray(src + x * FB_BPP);
     }
+    despeckle_crop(crop_gray, FB_WIDTH, CROP_HEIGHT);
 
-    /* 3. Find content bottom */
-    int content_bottom = find_content_bottom(fb);
+    /* 3. Detect new content outside known regions (using despeckled crop) */
+    int content_bottom = 0;
+    {
+        int found = 0;
+        int bottom_y = -1;
+        for (int y = 0; y < CROP_HEIGHT; y++) {
+            for (int x = 0; x < FB_WIDTH; x++) {
+                if (g_influence[y][x] > INFLUENCE_THRESH) continue;
+                if (crop_gray[y * FB_WIDTH + x] < DARK_THRESHOLD) {
+                    found = 1;
+                    bottom_y = y;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            log_msg("Pipeline: no new content\n");
+            free(crop_gray);
+            free(fb);
+            return;
+        }
+        content_bottom = bottom_y + CROP_TOP + 30;
+        if (content_bottom >= FB_HEIGHT - CROP_BOTTOM)
+            content_bottom = FB_HEIGHT - CROP_BOTTOM - 1;
+    }
     log_msg("Pipeline: content_bottom=%d\n", content_bottom);
 
-    /* 4. Save cropped PNG for API */
-    if (save_cropped_png(fb, CAPTURE_OUT_PATH) != 0) {
-        log_msg("Pipeline: PNG save failed\n");
-        free(fb);
-        return;
+    /* 4. Apply influence mask to despeckled crop and save as PNG for API */
+    apply_influence_mask(crop_gray);
+    {
+        FILE *fp = fopen(CAPTURE_OUT_PATH, "wb");
+        if (!fp) { log_msg("Pipeline: PNG open failed\n"); free(crop_gray); free(fb); return; }
+        png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
+        if (!png) { fclose(fp); free(crop_gray); free(fb); return; }
+        png_infop info = png_create_info_struct(png);
+        if (!info) { png_destroy_write_struct(&png, NULL); fclose(fp); free(crop_gray); free(fb); return; }
+        if (setjmp(png_jmpbuf(png))) { png_destroy_write_struct(&png, &info); fclose(fp); free(crop_gray); free(fb); return; }
+        png_init_io(png, fp);
+        png_set_IHDR(png, info, FB_WIDTH, CROP_HEIGHT, 8, PNG_COLOR_TYPE_GRAY, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+        png_write_info(png, info);
+        for (int y = 0; y < CROP_HEIGHT; y++)
+            png_write_row(png, crop_gray + y * FB_WIDTH);
+        png_write_end(png, NULL);
+        png_destroy_write_struct(&png, &info);
+        fclose(fp);
     }
+    free(crop_gray);
     free(fb);
 
     /* 5. Draw ornaments once (first reply only), then show thinking dots */
@@ -1235,6 +1422,7 @@ static void run_pipeline(void) {
         long orn_size = 0;
         if (load_file(ORNAMENTS_PATH, &orn_json, &orn_size) == 0 && orn_size > 0) {
             log_msg("Pipeline: drawing ornaments (%ld bytes)\n", orn_size);
+            mark_strokes_from_json(orn_json);
             pthread_mutex_lock(&g_inject_lock);
             do_draw(g_dev_fd, orn_json, 3000);
             pthread_mutex_unlock(&g_inject_lock);
@@ -1290,6 +1478,7 @@ static void run_pipeline(void) {
             char *json = NULL;
             long fsize = 0;
             if (load_file(RENDER_OUT_PATH, &json, &fsize) == 0) {
+                mark_strokes_from_json(json);
                 pthread_mutex_lock(&g_inject_lock);
                 do_draw(g_dev_fd, json, 3000);
                 pthread_mutex_unlock(&g_inject_lock);
@@ -1301,6 +1490,7 @@ static void run_pipeline(void) {
             /* If there's more text, swipe to next page */
             if (*remaining) {
                 log_msg("Pipeline: swiping to next page\n");
+                clear_influence_map();  /* new page = fresh mask */
                 usleep(500000);  /* brief pause before swipe */
                 pthread_mutex_lock(&g_inject_lock);
                 do_swipe_page();
